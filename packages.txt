@@ -1,6 +1,4 @@
 tesseract-ocr
 tesseract-ocr-spa
 poppler-utils
-ffmpeg
-libsm6
-libxext6
+libgl1-mesa-glx
