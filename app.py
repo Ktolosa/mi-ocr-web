@@ -2,102 +2,113 @@ import streamlit as st
 import pytesseract
 from pdf2image import convert_from_bytes
 import pandas as pd
-import re
 import io
 import shutil
+import re
 
-# --- 1. CONFIGURACIÓN DE LA PÁGINA ---
-st.set_page_config(page_title="OCR Facturas", layout="centered")
+# --- CONFIGURACIÓN ---
+st.set_page_config(page_title="OCR Universal", layout="wide")
+st.title("📄 Digitalizador de Tablas (Formato Libre)")
+st.markdown("""
+Este sistema no busca palabras clave. **Intenta reconstruir la tabla visualmente**.
+Funciona detectando los espacios en blanco entre columnas.
+""")
 
-st.title("📄 Extractor de Facturas (Versión Nube)")
-st.info("Sube tu PDF y el sistema extraerá Fecha, Folio y Total.")
-
-# --- 2. AUTODIAGNÓSTICO (Para evitar errores silenciosos) ---
-# Esto verifica si packages.txt se instaló bien
-tesseract_check = shutil.which("tesseract")
-poppler_check = shutil.which("pdftoppm")
-
-if not tesseract_check:
-    st.error("❌ ERROR CRÍTICO: Tesseract no está instalado. Revisa el archivo 'packages.txt' en GitHub.")
-    st.stop()
-    
-if not poppler_check:
-    st.error("❌ ERROR CRÍTICO: Poppler no está instalado. Revisa el archivo 'packages.txt' en GitHub.")
+# --- VERIFICACIÓN DE SISTEMA ---
+if not shutil.which("tesseract"):
+    st.error("❌ Error: Tesseract no está instalado.")
     st.stop()
 
-# --- 3. FUNCIONES DE EXTRACCIÓN ---
-def parse_invoice_data(text):
-    """Busca los datos clave en el texto extraído."""
-    data = {}
+# --- LÓGICA UNIVERSAL ---
+def extract_general_data(image):
+    """
+    Extrae texto intentando conservar la estructura de columnas
+    basada en espacios visuales.
+    """
+    # CONFIGURACIÓN CLAVE:
+    # --psm 6: Asume un bloque de texto uniforme (bueno para tablas)
+    # preserve_interword_spaces=1: NO borres los espacios grandes, los necesitamos
+    custom_config = r'--oem 3 --psm 6 -c preserve_interword_spaces=1'
     
-    # Fecha (dd/mm/yyyy o dd-mm-yyyy)
-    fecha_match = re.search(r'(\d{2}[-/]\d{2}[-/]\d{4})', text)
-    data['Fecha'] = fecha_match.group(1) if fecha_match else "No detectada"
-
-    # Total (Busca 'Total' seguido de precio)
-    total_match = re.search(r'Total.*?\s*[\$]?\s*([\d,]+\.\d{2})', text, re.IGNORECASE)
-    data['Total'] = total_match.group(1) if total_match else "0.00"
-
-    # Folio (Busca Factura o Folio)
-    folio_match = re.search(r'(?:Factura|Folio)\s*[:.]?\s*([A-Za-z0-9-]+)', text, re.IGNORECASE)
-    data['Folio'] = folio_match.group(1) if folio_match else "No detectado"
+    raw_text = pytesseract.image_to_string(image, lang='spa', config=custom_config)
     
-    return data
+    rows = []
+    
+    # Procesar línea por línea
+    for line in raw_text.split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+            
+        # EL TRUCO: Cortar cuando haya 2 o más espacios seguidos
+        # Esto separa "Descripción      $10.00" en ["Descripción", "$10.00"]
+        # pero mantiene "San Salvador" junto (porque solo tiene 1 espacio).
+        cells = re.split(r'\s{2,}', line)
+        rows.append(cells)
+    
+    return rows
 
 def process_pdf(file_bytes):
     try:
-        # Convertir PDF a imágenes
         images = convert_from_bytes(file_bytes)
-        all_pages_data = []
+        all_data = []
         
+        # Procesamos las páginas
         for i, image in enumerate(images):
-            # Extraer texto de la imagen
-            text = pytesseract.image_to_string(image, lang='spa')
+            page_rows = extract_general_data(image)
             
-            # Analizar texto
-            page_data = parse_invoice_data(text)
-            page_data['Página'] = i + 1
-            all_pages_data.append(page_data)
-            
-        return all_pages_data
+            # Añadimos una marca de qué página es
+            for row in page_rows:
+                # Agregamos el número de página al principio de la fila
+                row.insert(0, f"Pág {i+1}")
+                all_data.append(row)
+                
+        return all_data
+        
     except Exception as e:
         return f"Error: {str(e)}"
 
-# --- 4. INTERFAZ DE USUARIO ---
-uploaded_file = st.file_uploader("Arrastra tu PDF aquí", type=["pdf"])
+# --- INTERFAZ ---
+uploaded_file = st.file_uploader("Sube cualquier PDF con tablas", type=["pdf"])
 
 if uploaded_file is not None:
-    # Botón de acción manual para estabilidad
-    if st.button("🔍 Extraer Datos"):
+    if st.button("🚀 Digitalizar Documento"):
         
-        with st.spinner('Procesando... esto puede tardar unos segundos...'):
-            # Leemos el archivo
+        with st.status("Analizando estructura visual...", expanded=True) as status:
             file_bytes = uploaded_file.read()
-            resultado = process_pdf(file_bytes)
-
-        # Verificar resultados
-        if isinstance(resultado, str):
-            st.error(resultado) # Mostrar error si falló la función
-        elif resultado:
-            st.success("✅ ¡Procesamiento Exitoso!")
+            raw_data = process_pdf(file_bytes)
             
-            # Crear tabla
-            df = pd.DataFrame(resultado)
-            cols = ['Página', 'Fecha', 'Folio', 'Total']
-            # Filtrar columnas existentes
-            df = df[[c for c in cols if c in df.columns]]
-            
-            # Mostrar datos
-            st.dataframe(df, use_container_width=True)
-            
-            # Botón descargar Excel
-            buffer = io.BytesIO()
-            with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-                df.to_excel(writer, index=False)
+            if isinstance(raw_data, str): # Si devolvió un mensaje de error
+                status.update(label="Falló", state="error")
+                st.error(raw_data)
+            else:
+                status.update(label="¡Completado!", state="complete")
                 
-            st.download_button(
-                label="📥 Descargar Excel",
-                data=buffer.getvalue(),
-                file_name="reporte_facturas.xlsx",
-                mime="application/vnd.ms-excel"
-            )
+                # --- NORMALIZAR DATAFRAME ---
+                # Como cada fila puede tener diferente número de columnas, 
+                # buscamos la fila más larga para crear las columnas del Excel.
+                if raw_data:
+                    max_cols = max(len(row) for row in raw_data)
+                    column_names = [f"Columna {i}" for i in range(max_cols)]
+                    
+                    # Convertir a DataFrame rellenando huecos
+                    df = pd.DataFrame(raw_data, columns=column_names) # Pandas rellena auto los None
+                    
+                    st.success("✅ Datos extraídos respetando el formato visual")
+                    
+                    # Mostrar tabla
+                    st.dataframe(df, use_container_width=True)
+                    
+                    # Exportar a Excel
+                    buffer = io.BytesIO()
+                    with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+                        df.to_excel(writer, index=False, header=False) # Sin encabezados forzados
+                        
+                    st.download_button(
+                        label="📥 Descargar Excel (Formato Original)",
+                        data=buffer.getvalue(),
+                        file_name="tabla_digitalizada.xlsx",
+                        mime="application/vnd.ms-excel"
+                    )
+                else:
+                    st.warning("No se pudo extraer texto legible del documento.")
