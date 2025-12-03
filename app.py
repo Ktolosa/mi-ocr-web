@@ -8,41 +8,67 @@ import shutil
 import re
 
 # --- CONFIGURACIÓN ---
-st.set_page_config(page_title="Extractor Regal V14", layout="wide")
-st.title("📄 Extractor Regal Trading (V14: Modo Rescate)")
+st.set_page_config(page_title="Extractor Regal V15", layout="wide")
+st.title("📄 Extractor Regal Trading (V15: Precisión Total)")
 
 if not shutil.which("tesseract"):
     st.error("❌ Error: Tesseract no está instalado.")
     st.stop()
 
 # ==========================================
-# 🛠️ UTILIDADES
+# 🛠️ UTILIDADES AVANZADAS
 # ==========================================
 def clean_text_block(text):
     if not text: return ""
     return " ".join(text.split())
 
 def clean_upc(text):
+    """Corrige errores de OCR en códigos UPC"""
     if not text: return ""
     text = text.replace(" ", "").strip()
     if len(text) > 8 and text.startswith("A"):
         return "4" + text[1:]
     return text
 
-def extract_money(text_list):
-    """Busca precio tolerante a espacios (ej: '6 . 25')"""
-    for text in reversed(text_list):
-        # Limpiar simbolos y espacios internos excesivos
+def extract_money_aggressive(text_list):
+    """
+    Busca precios incluso si están rotos (ej: '6 . 25', '1, 200. 00')
+    """
+    candidates = []
+    for text in text_list:
+        # Limpiar basura alrededor
         clean = text.replace('$', '').replace('S', '').strip()
-        # Regex flexible: permite espacios entre digitos y puntos
-        if re.search(r'\d+[\s]*[.,][\s]*\d{2}', clean):
-            return clean.replace(" ", "") # Devolver limpio
+        if not clean: continue
+        
+        # 1. Caso perfecto (10.65)
+        if re.match(r'^\d{1,3}(?:,\d{3})*\.\d{2}$', clean):
+            return clean
+            
+        candidates.append(clean)
+    
+    # 2. Si no hay perfectos, intentar reconstruir precios rotos en la lista
+    # Unimos todo el texto encontrado en la columna de precio
+    full_text = " ".join(candidates)
+    
+    # Buscamos patrón de precio con espacios flexibles: Digitos + espacio/punto/coma + 2 Digitos
+    # Ej: Captura "6 . 25", "2 .07", "10 . 65"
+    matches = re.findall(r'(\d+[\s.,]+\d{2})\b', full_text)
+    
+    if matches:
+        # Tomamos el último (suele ser el Total o el más limpio)
+        best_match = matches[-1]
+        # Normalizamos: Quitamos espacios y aseguramos formato 0.00
+        normalized = best_match.replace(" ", "").replace(",", ".")
+        # Si quedó .. corregir
+        normalized = normalized.replace("..", ".")
+        return normalized
+        
     return ""
 
 # ==========================================
-# 🧠 LÓGICA DE ITEMS (V14: DOBLE PASADA)
+# 🧠 LÓGICA DE ITEMS (V15)
 # ==========================================
-def extract_items_v14(image):
+def extract_items_v15(image):
     d = pytesseract.image_to_data(image, output_type=Output.DICT, lang='spa', config='--psm 6')
     n_boxes = len(d['text'])
     w, h = image.size
@@ -54,7 +80,7 @@ def extract_items_v14(image):
     X_UPC_END = w * 0.72
     X_PRICE_END = w * 0.88
     
-    # 1. DETECTAR CANDIDATOS (Cualquier número a la izquierda)
+    # 1. DETECTAR TODOS LOS NÚMEROS A LA IZQUIERDA
     candidates = []
     min_y = h * 0.25 
     max_y = h * 0.85
@@ -66,42 +92,36 @@ def extract_items_v14(image):
         
         if cy < min_y or cy > max_y: continue
         
-        # Filtro básico: Número a la izquierda
         if cx < X_QTY_LIMIT and re.match(r'^[0-9.,]+$', text):
             if d['height'][i] > 8: 
                 candidates.append({'y': cy, 'qty': text})
 
-    # 2. VALIDACIÓN (FILTRO ANTI-FANTASMA)
+    # 2. FILTRO ESTRICTO (ANTI-FANTASMAS)
     valid_anchors = []
     
     for cand in candidates:
         row_y = cand['y']
         has_price = False
         
-        # Búsqueda Horizontal Ampliada (+/- 50px)
+        # Búsqueda Horizontal ESTRICTA (+/- 10px)
+        # Esto evita que el "2" (fantasma) robe el precio de la fila de arriba
         for i in range(n_boxes):
             word = d['text'][i].strip()
             if not word: continue
             wy = d['top'][i]
             wx = d['left'][i]
             
-            if (row_y - 50) <= wy <= (row_y + 50): # Rango vertical aumentado
+            if (row_y - 10) <= wy <= (row_y + 10): 
                 if wx > X_UPC_END: 
-                    # Regex flexible para dinero
-                    if re.search(r'\d+[\s]*[.,][\s]*\d{2}', word) or '$' in word:
+                    # Cualquier cosa que parezca número o moneda
+                    if re.search(r'\d', word) or '$' in word:
                         has_price = True
                         break
         
         if has_price:
             valid_anchors.append(cand)
 
-    # --- MODO RESCATE ---
-    # Si el filtro estricto borró todo, usamos los candidatos originales
-    # Esto pasa si el PDF tiene mala calidad y no se leen bien los precios
-    if not valid_anchors and candidates:
-        valid_anchors = candidates 
-
-    # Filtrar duplicados verticales
+    # Filtrar duplicados muy cercanos
     valid_anchors.sort(key=lambda k: k['y'])
     final_anchors = []
     if valid_anchors:
@@ -113,8 +133,10 @@ def extract_items_v14(image):
     # 3. EXTRAER DATOS
     items = []
     for idx, anchor in enumerate(final_anchors):
+        # TECHO: 30px arriba para capturar modelo
         y_top = anchor['y'] - 30 
         
+        # PISO
         if idx + 1 < len(final_anchors):
             y_bottom = final_anchors[idx+1]['y'] - 5
         else:
@@ -138,10 +160,9 @@ def extract_items_v14(image):
                 # UPC
                 elif X_DESC_END <= bx < X_UPC_END:
                     if len(word) > 3 and word != "CHN":
-                        clean_word = clean_upc(word)
-                        upc_tokens.append(clean_word)
+                        upc_tokens.append(clean_upc(word))
 
-                # Precio
+                # Precio Unitario
                 elif X_UPC_END <= bx < X_PRICE_END:
                     unit_tokens.append(word)
                         
@@ -156,8 +177,9 @@ def extract_items_v14(image):
             "Cantidad": anchor['qty'],
             "Descripción": full_desc,
             "UPC": " ".join(upc_tokens),
-            "Precio Unit.": extract_money(unit_tokens),
-            "Total": extract_money(total_tokens)
+            # Usamos la nueva función agresiva
+            "Precio Unit.": extract_money_aggressive(unit_tokens),
+            "Total": extract_money_aggressive(total_tokens)
         })
         
     return items
@@ -224,14 +246,8 @@ if uploaded_files:
                             txt = pytesseract.image_to_string(img, lang='spa')
                             header = extract_header_data(txt)
                         
-                        # Usar lógica V14
-                        items = extract_items_v14(img)
-                        
-                        if items:
-                            file_items.extend(items)
-                        else:
-                            st.warning(f"Página {i+1}: No se detectaron items legibles.")
-                            
+                        items = extract_items_v15(img)
+                        file_items.extend(items)
                         pg_count += 1
                     
                     if file_items:
@@ -243,7 +259,7 @@ if uploaded_files:
                             row['Archivo'] = f.name
                             all_data.append(row)
                     else:
-                        st.error("No se encontraron items en ninguna página original.")
+                        st.error("No se encontraron items válidos.")
                         
                 except Exception as e:
                     st.error(f"Error: {e}")
@@ -260,4 +276,4 @@ if uploaded_files:
                 df_final[final_cols].to_excel(writer, index=False)
                 writer.sheets['Sheet1'].set_column('H:H', 50)
             
-            st.download_button("📥 Excel Final", buffer.getvalue(), "Reporte_Regal.xlsx")
+            st.download_button("📥 Excel Final", buffer.getvalue(), "Reporte_Regal_V15.xlsx")
