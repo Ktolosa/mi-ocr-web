@@ -8,8 +8,8 @@ import shutil
 import re
 
 # --- CONFIGURACIÓN ---
-st.set_page_config(page_title="Extractor Regal V13", layout="wide")
-st.title("📄 Extractor Regal (V13: Anti-Fantasmas)")
+st.set_page_config(page_title="Extractor Regal V14", layout="wide")
+st.title("📄 Extractor Regal Trading (V14: Modo Rescate)")
 
 if not shutil.which("tesseract"):
     st.error("❌ Error: Tesseract no está instalado.")
@@ -23,27 +23,26 @@ def clean_text_block(text):
     return " ".join(text.split())
 
 def clean_upc(text):
-    """Corrección específica: Cambia 'A' inicial por '4' en UPCs largos"""
     if not text: return ""
     text = text.replace(" ", "").strip()
-    # Si tiene más de 8 caracteres y empieza con A, es un error de OCR común
     if len(text) > 8 and text.startswith("A"):
         return "4" + text[1:]
     return text
 
 def extract_money(text_list):
-    """Busca un valor monetario válido en una lista de candidatos"""
+    """Busca precio tolerante a espacios (ej: '6 . 25')"""
     for text in reversed(text_list):
+        # Limpiar simbolos y espacios internos excesivos
         clean = text.replace('$', '').replace('S', '').strip()
-        # Busca formato: digitos + punto/coma + 2 decimales
-        if re.search(r'\d+[.,]\d{2}', clean):
-            return clean
+        # Regex flexible: permite espacios entre digitos y puntos
+        if re.search(r'\d+[\s]*[.,][\s]*\d{2}', clean):
+            return clean.replace(" ", "") # Devolver limpio
     return ""
 
 # ==========================================
-# 🧠 LÓGICA DE ITEMS (V13: FILTRO DE PRECIO OBLIGATORIO)
+# 🧠 LÓGICA DE ITEMS (V14: DOBLE PASADA)
 # ==========================================
-def extract_items_v13(image):
+def extract_items_v14(image):
     d = pytesseract.image_to_data(image, output_type=Output.DICT, lang='spa', config='--psm 6')
     n_boxes = len(d['text'])
     w, h = image.size
@@ -67,41 +66,42 @@ def extract_items_v13(image):
         
         if cy < min_y or cy > max_y: continue
         
-        # Si es número y está a la izquierda
+        # Filtro básico: Número a la izquierda
         if cx < X_QTY_LIMIT and re.match(r'^[0-9.,]+$', text):
             if d['height'][i] > 8: 
                 candidates.append({'y': cy, 'qty': text})
 
-    # 2. VALIDACIÓN ESTRICTA (ELIMINAR EL "2" FANTASMA)
+    # 2. VALIDACIÓN (FILTRO ANTI-FANTASMA)
     valid_anchors = []
     
     for cand in candidates:
         row_y = cand['y']
+        has_price = False
         
-        # Buscamos SI EXISTE UN PRECIO en la misma línea visual
-        # Si no hay precio, asumimos que el número a la izquierda es basura de la descripción
-        has_price_confirmation = False
-        
+        # Búsqueda Horizontal Ampliada (+/- 50px)
         for i in range(n_boxes):
             word = d['text'][i].strip()
             if not word: continue
             wy = d['top'][i]
             wx = d['left'][i]
             
-            # Margen vertical +/- 20px
-            if (row_y - 20) <= wy <= (row_y + 20):
-                # Miramos en la zona de PRECIO o TOTAL
+            if (row_y - 50) <= wy <= (row_y + 50): # Rango vertical aumentado
                 if wx > X_UPC_END: 
-                    # ¿Tiene formato de dinero (xx.xx)?
-                    if re.search(r'\d+[.,]\d{2}', word):
-                        has_price_confirmation = True
+                    # Regex flexible para dinero
+                    if re.search(r'\d+[\s]*[.,][\s]*\d{2}', word) or '$' in word:
+                        has_price = True
                         break
         
-        # SOLO GUARDAMOS LA FILA SI TIENE PRECIO CONFIRMADO
-        if has_price_confirmation:
+        if has_price:
             valid_anchors.append(cand)
 
-    # Filtrar duplicados cercanos
+    # --- MODO RESCATE ---
+    # Si el filtro estricto borró todo, usamos los candidatos originales
+    # Esto pasa si el PDF tiene mala calidad y no se leen bien los precios
+    if not valid_anchors and candidates:
+        valid_anchors = candidates 
+
+    # Filtrar duplicados verticales
     valid_anchors.sort(key=lambda k: k['y'])
     final_anchors = []
     if valid_anchors:
@@ -113,10 +113,8 @@ def extract_items_v13(image):
     # 3. EXTRAER DATOS
     items = []
     for idx, anchor in enumerate(final_anchors):
-        # TECHO: 30px arriba para capturar modelo
         y_top = anchor['y'] - 30 
         
-        # PISO: Siguiente fila
         if idx + 1 < len(final_anchors):
             y_bottom = final_anchors[idx+1]['y'] - 5
         else:
@@ -137,13 +135,13 @@ def extract_items_v13(image):
                 if X_DESC_START < bx < X_DESC_END:
                     desc_tokens.append((by, bx, word))
                 
-                # UPC (Con corrección automática de A -> 4)
+                # UPC
                 elif X_DESC_END <= bx < X_UPC_END:
                     if len(word) > 3 and word != "CHN":
                         clean_word = clean_upc(word)
                         upc_tokens.append(clean_word)
 
-                # Precio Unitario
+                # Precio
                 elif X_UPC_END <= bx < X_PRICE_END:
                     unit_tokens.append(word)
                         
@@ -226,8 +224,14 @@ if uploaded_files:
                             txt = pytesseract.image_to_string(img, lang='spa')
                             header = extract_header_data(txt)
                         
-                        items = extract_items_v13(img)
-                        file_items.extend(items)
+                        # Usar lógica V14
+                        items = extract_items_v14(img)
+                        
+                        if items:
+                            file_items.extend(items)
+                        else:
+                            st.warning(f"Página {i+1}: No se detectaron items legibles.")
+                            
                         pg_count += 1
                     
                     if file_items:
@@ -239,7 +243,7 @@ if uploaded_files:
                             row['Archivo'] = f.name
                             all_data.append(row)
                     else:
-                        st.error("No se encontraron items válidos.")
+                        st.error("No se encontraron items en ninguna página original.")
                         
                 except Exception as e:
                     st.error(f"Error: {e}")
