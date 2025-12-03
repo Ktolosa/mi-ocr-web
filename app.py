@@ -9,7 +9,7 @@ import re
 
 # --- CONFIGURACIÓN ---
 st.set_page_config(page_title="Extractor Regal Final", layout="wide")
-st.title("📄 Extractor Regal Trading (Versión Mejorada)")
+st.title("📄 Extractor Regal Trading (Versión Restaurada)")
 
 # --- VERIFICACIÓN ---
 if not shutil.which("tesseract"):
@@ -17,26 +17,20 @@ if not shutil.which("tesseract"):
     st.stop()
 
 # ==========================================
-# 🛠️ UTILIDADES
+# 🧠 LÓGICA DE ITEMS (RESTAURADA A LA VERSIÓN QUE FUNCIONABA)
 # ==========================================
-def clean_text(text):
-    """Limpia saltos de línea y espacios múltiples"""
-    return " ".join(text.split())
-
-# ==========================================
-# 🧠 LÓGICA DE ITEMS (MEJORADA: MIRA ARRIBA Y A LA IZQUIERDA)
-# ==========================================
-def extract_items_precision(image):
-    # 1. Obtener datos detallados
+def extract_items_restored(image):
+    # 1. Obtener datos
+    # Usamos psm 6 para leer filas coherentes
     d = pytesseract.image_to_data(image, output_type=Output.DICT, lang='spa', config='--psm 6')
     n_boxes = len(d['text'])
     w, h = image.size
     
-    # --- COORDENADAS AJUSTADAS ---
-    # Cantidad: Buscamos hasta el 14% para asegurar que atrapamos el número
-    X_QTY_SEARCH = w * 0.14    
+    # --- MÁRGENES AMPLIOS (TOLERANCIA ALTA) ---
+    # Cantidad: Buscamos hasta el 15% para asegurar que atrapamos el número aunque se mueva
+    X_QTY_LIMIT = w * 0.15    
     
-    # Descripción: Empieza ANTES (10%) para atrapar texto largo a la izquierda
+    # Descripción: Empieza MUY a la izquierda (10%) para atrapar "TCL"
     X_DESC_START = w * 0.10 
     X_DESC_END = w * 0.58
     
@@ -55,11 +49,17 @@ def extract_items_precision(image):
         cx = d['left'][i]
         cy = d['top'][i]
         
+        # Filtro vertical básico
         if cy < start_y or cy > end_y: continue
         
-        # Si es un número y está en la columna izquierda
-        if cx < X_QTY_SEARCH and re.match(r'^\d+$', text):
-            anchors.append({'y': cy, 'qty': text})
+        # --- AQUÍ ESTABA LA CLAVE ---
+        # Usamos re.search en lugar de re.match.
+        # re.search encuentra "234" incluso si Tesseract lee ".234" o "234_"
+        # Además, el límite X_QTY_LIMIT es generoso (15%)
+        if cx < X_QTY_LIMIT and re.search(r'\d+', text):
+            # Filtro anti-ruido: ignorar cosas muy pequeñas (menos de 10px de altura)
+            if d['height'][i] > 8: 
+                anchors.append({'y': cy, 'qty': text})
 
     if not anchors: return []
 
@@ -67,10 +67,8 @@ def extract_items_precision(image):
     items = []
     
     for idx, anchor in enumerate(anchors):
-        # AQUÍ ESTÁ EL TRUCO:
-        # Definimos el techo de la fila 30 pixeles ARRIBA de donde está el número.
-        # Esto atrapa la línea superior de la descripción.
-        y_top = anchor['y'] - 30
+        # Miramos 35 pixeles ARRIBA para atrapar la línea superior de la descripción
+        y_top = anchor['y'] - 35
         
         # El piso es la siguiente fila
         if idx + 1 < len(anchors):
@@ -119,39 +117,35 @@ def extract_items_precision(image):
     return items
 
 # ==========================================
-# 🧠 LÓGICA DE ENCABEZADO (ROBUSTA)
+# 🧠 LÓGICA DE ENCABEZADO (ROBUSTA - LA QUE SÍ FUNCIONABA)
 # ==========================================
+def clean_text(text):
+    return " ".join(text.split())
+
 def extract_header_robust(full_text):
-    """
-    Extrae los datos del encabezado buscando en todo el texto, 
-    sin depender de coordenadas fijas que pueden fallar.
-    """
     data = {}
     
-    # 1. FACTURA (Busca # seguido de 6 dígitos)
+    # FACTURA
     inv = re.search(r'(?:#|No\.|297107)\s*(\d{6})', full_text)
-    # Fallback: busca solo el número si está flotando
     if not inv: inv = re.search(r'#\s*(\d{6})', full_text)
     data['Factura'] = inv.group(1) if inv else ""
 
-    # 2. FECHAS (Soporta formatos Inglés y Español)
+    # FECHA
     date = re.search(r'(?:DATE|FECHA)\s*[:.,]?\s*([A-Za-z]{3}\s+\d{1,2}[,.]?\s+\d{4})', full_text, re.IGNORECASE)
     data['Fecha'] = date.group(1) if date else ""
 
-    # 3. ORDEN
+    # ORDEN
     orden = re.search(r'(?:ORDER|ORDEN)\s*#?\s*[:.,]?\s*(\d+)', full_text, re.IGNORECASE)
     data['Orden'] = orden.group(1) if orden else ""
 
-    # 4. REFERENCIAS
+    # REF
     ref = re.search(r'(?:FILE|REF)\s*[:.,]?\s*([A-Z0-9]+)', full_text, re.IGNORECASE)
     data['Ref'] = ref.group(1) if ref else ""
 
-    # 5. DIRECCIONES (Usando delimitadores de bloque)
-    # Vendido A: Desde "VENDIDO A" hasta "EMBARCADO A" o "FECHA"
+    # DIRECCIONES
     sold = re.search(r'SOLD TO/VENDIDO A:(.*?)(?=SHIP TO|124829|\d{2}/\d{2})', full_text, re.DOTALL)
     data['Vendido A'] = clean_text(sold.group(1)) if sold else ""
 
-    # Embarcado A: Desde "EMBARCADO A" hasta "PAGO" o "FECHA"
     ship = re.search(r'SHIP TO/EMBARCADO A:(.*?)(?=PAYMENT|DUE DATE|PAGE)', full_text, re.DOTALL)
     data['Embarcado A'] = clean_text(ship.group(1)) if ship else ""
     
@@ -176,8 +170,8 @@ if uploaded_file is not None:
                 full_text = pytesseract.image_to_string(target_img, lang='spa')
                 header_data = extract_header_robust(full_text)
                 
-                # 3. Items (Coordenadas ajustadas)
-                items_data = extract_items_precision(target_img)
+                # 3. Items (Lógica Restaurada)
+                items_data = extract_items_restored(target_img)
                 
                 status.update(label="¡Completado!", state="complete")
                 
@@ -203,17 +197,15 @@ if uploaded_file is not None:
                     # Excel
                     buffer = io.BytesIO()
                     with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-                        # Hoja 1
                         pd.DataFrame([header_data]).to_excel(writer, sheet_name="General", index=False)
-                        # Hoja 2
                         df.to_excel(writer, sheet_name="Items", index=False)
                         
-                        # Formato
+                        # Formato Ancho
                         workbook = writer.book
                         worksheet = writer.sheets['Items']
-                        worksheet.set_column('B:B', 60) # Columna descripción ancha
+                        worksheet.set_column('B:B', 70) 
                         format_wrap = workbook.add_format({'text_wrap': True})
-                        worksheet.set_column('B:B', 60, format_wrap)
+                        worksheet.set_column('B:B', 70, format_wrap)
                     
                     st.download_button(
                         "📥 Descargar Excel",
@@ -222,7 +214,7 @@ if uploaded_file is not None:
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                     )
                 else:
-                    st.warning("No se detectaron items. Intenta escanear con mayor calidad.")
+                    st.warning("No se detectaron items.")
                     
             except Exception as e:
                 st.error(f"Error técnico: {e}")
