@@ -1,5 +1,8 @@
 streamlit
+pytesseract
 pdf2image
 pandas
 xlsxwriter
+openpyxl
+Pillow
 google-generativeai>=0.7.0
