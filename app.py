@@ -8,18 +8,18 @@ import shutil
 import re
 
 # --- CONFIGURACIÓN ---
-st.set_page_config(page_title="Sistema OCR Dual V18", layout="wide")
-st.title("🧰 Sistema OCR Multiusos (General Optimizado)")
+st.set_page_config(page_title="Sistema OCR Dual V19", layout="wide")
+st.title("🧰 Sistema OCR Multiusos (Compacto)")
 
 if not shutil.which("tesseract"):
     st.error("❌ Error: Tesseract no está instalado.")
     st.stop()
 
-# --- BARRA LATERAL (SELECTOR DE MODO) ---
+# --- BARRA LATERAL ---
 st.sidebar.header("⚙️ Configuración")
 modo_app = st.sidebar.radio(
     "Selecciona la Herramienta:",
-    ["1. Extractor Regal Trading (Específico)", "2. OCR General (Réplica Limpia)"]
+    ["1. Extractor Regal Trading (Específico)", "2. OCR General (Compacto y Limpio)"]
 )
 
 # ==============================================================================
@@ -144,13 +144,13 @@ def is_duplicate(image):
     return bool(re.search(r'Duplicado', txt, re.IGNORECASE))
 
 # ==============================================================================
-# 🧩 MÓDULO 2: OCR GENERAL MEJORADO (COMPRESIÓN DE ESPACIOS)
+# 🧩 MÓDULO 2: OCR GENERAL (LÓGICA COMPACTA SIN HUECOS)
 # ==============================================================================
 
-def generate_compact_spatial_excel(images):
+def generate_compact_excel(images):
     """
-    Crea una réplica visual pero elimina el exceso de filas y columnas vacías.
-    Agrupa elementos cercanos.
+    Agrupa el texto en líneas y lo escribe secuencialmente en Excel.
+    Sin columnas vacías intermedias.
     """
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
@@ -158,64 +158,63 @@ def generate_compact_spatial_excel(images):
         cell_fmt = workbook.add_format({'text_wrap': False, 'valign': 'top', 'font_size': 10})
         
         for i, image in enumerate(images):
-            # 1. Obtener datos detallados
-            # --psm 6 ayuda a leer líneas completas
-            data = pytesseract.image_to_data(image, output_type=Output.DICT, lang='spa', config='--psm 6')
+            # 1. Obtener datos con cajas
+            # --psm 6 para asumir bloque de texto uniforme
+            d = pytesseract.image_to_data(image, output_type=Output.DICT, lang='spa', config='--psm 6')
+            n_boxes = len(d['text'])
             
-            # Crear DataFrame para manipular coordenadas fácilmente
-            df = pd.DataFrame(data)
+            # Recolectar palabras válidas con sus coordenadas
+            words = []
+            for j in range(n_boxes):
+                txt = d['text'][j].strip()
+                if not txt: continue
+                words.append({
+                    'text': txt,
+                    'top': d['top'][j],
+                    'left': d['left'][j],
+                    'width': d['width'][j],
+                    'height': d['height'][j]
+                })
             
-            # Filtrar basura (texto vacío o confianza -1)
-            df = df[df.text.str.strip() != ""]
-            df = df.dropna(subset=['text'])
-            
-            if df.empty: continue
+            if not words: continue
 
-            # 2. AGRUPACIÓN DE FILAS (Row Snapping)
-            # Dividimos la posición Y entre 20. Esto significa que todo texto
-            # dentro de un rango de 20px de altura caerá en la misma fila de Excel.
-            ROW_HEIGHT_PX = 20
-            df['row_idx'] = (df['top'] // ROW_HEIGHT_PX).astype(int)
+            # 2. AGRUPAR POR LÍNEAS (Clustering Vertical)
+            # Ordenar por posición Y
+            words.sort(key=lambda k: k['top'])
             
-            # Normalizar filas (Para que empiece en la fila 0 de Excel)
-            min_row = df['row_idx'].min()
-            df['row_idx'] = df['row_idx'] - min_row
+            lines = []
+            current_line = []
             
-            # 3. AGRUPACIÓN DE COLUMNAS (Column Compression)
-            # Dividimos la posición X. Un valor más alto aquí (ej: 25)
-            # reduce más los espacios en blanco horizontales.
-            COL_WIDTH_PX = 18 
-            df['col_idx'] = (df['left'] // COL_WIDTH_PX).astype(int)
-            
-            # Normalizar columnas (Para que empiece en la columna A)
-            min_col = df['col_idx'].min()
-            df['col_idx'] = df['col_idx'] - min_col
+            if words:
+                current_line.append(words[0])
+                
+                for w in words[1:]:
+                    prev = current_line[-1]
+                    # Si la diferencia vertical es pequeña (<15px), es la misma línea
+                    if abs(w['top'] - prev['top']) < 15:
+                        current_line.append(w)
+                    else:
+                        # Nueva línea detectada
+                        lines.append(current_line)
+                        current_line = [w]
+                
+                lines.append(current_line) # Agregar la última
 
-            # 4. Escribir en Excel
+            # 3. ESCRIBIR EN EXCEL
             sheet_name = f"Pagina_{i+1}"
             worksheet = workbook.add_worksheet(sheet_name)
             
-            # Diccionario para evitar superposiciones
-            # Si dos palabras caen en la misma celda, las concatenamos
-            grid_map = {}
-            
-            for _, row in df.iterrows():
-                r, c = row['row_idx'], row['col_idx']
-                txt = str(row['text'])
+            for row_idx, line in enumerate(lines):
+                # Ordenar la línea de izquierda a derecha (X)
+                line.sort(key=lambda k: k['left'])
                 
-                if (r, c) in grid_map:
-                    # Si ya hay texto, agregamos un espacio y concatenamos
-                    # Esto arregla frases que se partieron
-                    grid_map[(r, c)] += " " + txt
-                else:
-                    grid_map[(r, c)] = txt
+                col_idx = 0
+                for word_obj in line:
+                    worksheet.write(row_idx, col_idx, word_obj['text'], cell_fmt)
+                    col_idx += 1
             
-            # Volcar el mapa al Excel
-            for (r, c), text in grid_map.items():
-                worksheet.write(r, c, text, cell_fmt)
-            
-            # Ajuste estético de columnas (Ancho fijo pequeño para simular grilla)
-            worksheet.set_column(0, df['col_idx'].max(), 2.5) 
+            # Ajustar ancho de columnas para que se lea bien
+            worksheet.set_column(0, 50, 15)
             
     return output
 
@@ -283,40 +282,31 @@ if uploaded_files:
                 st.download_button("📥 Descargar Reporte Regal", buffer.getvalue(), "Reporte_Regal.xlsx")
 
     # ---------------------------------------------------------
-    # MODO 2: OCR GENERAL (RÉPLICA LIMPIA)
+    # MODO 2: OCR GENERAL (COMPACTO)
     # ---------------------------------------------------------
-    elif modo_app == "2. OCR General (Réplica Limpia)":
-        st.info("ℹ️ Modo activo: Réplica visual compacta (elimina espacios vacíos excesivos).")
+    elif modo_app == "2. OCR General (Compacto y Limpio)":
+        st.info("ℹ️ Modo activo: Extrae todo el texto y lo organiza en filas continuas sin huecos.")
         
-        if st.button("✨ Generar Réplica Excel"):
-            with st.status("Generando réplica optimizada...", expanded=True) as status:
+        if st.button("✨ Generar Excel Compacto"):
+            with st.status("Procesando texto...", expanded=True) as status:
                 try:
-                    master_buffer = io.BytesIO()
-                    
-                    # Procesamos para crear el excel
-                    # Nota: Para este modo iteramos archivo por archivo y generamos un ZIP o un solo Excel con muchas hojas
-                    # Aquí haremos un solo Excel multi-hoja
-                    
-                    # Recargamos punteros de archivos
-                    for f in uploaded_files: f.seek(0)
-                    
-                    # Como pdf2image necesita leer bytes, leemos el primero para el ejemplo o todos
-                    # Simplificación: Procesamos todos los archivos en un solo libro Excel
-                    
+                    # Leemos todos los archivos
                     all_images = []
                     for f in uploaded_files:
+                        f.seek(0)
                         imgs = convert_from_bytes(f.read(), dpi=200)
                         all_images.extend(imgs)
                     
-                    excel_data = generate_compact_spatial_excel(all_images)
+                    # Generamos Excel
+                    excel_data = generate_compact_excel(all_images)
                     
-                    status.update(label="¡Réplica Creada!", state="complete")
-                    st.success("✅ Excel generado con espacios optimizados.")
+                    status.update(label="¡Listo!", state="complete")
+                    st.success("✅ Excel generado sin celdas vacías intermedias.")
                     
                     st.download_button(
-                        "📥 Descargar Réplica Compacta", 
+                        "📥 Descargar Excel Compacto", 
                         excel_data.getvalue(), 
-                        "Replica_General.xlsx"
+                        "OCR_General_Compacto.xlsx"
                     )
                     
                 except Exception as e:
