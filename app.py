@@ -6,24 +6,39 @@ import pandas as pd
 import io
 import shutil
 import re
+import json
+import time
+import google.generativeai as genai
 
 # --- CONFIGURACIÓN ---
-st.set_page_config(page_title="Sistema OCR V24", layout="wide")
-st.title("🧰 Sistema de Extracción: Facturas & DUCA")
+st.set_page_config(page_title="Sistema Híbrido OCR+IA", layout="wide")
+st.title("🤖 Sistema de Extracción Inteligente (Híbrido)")
 
 if not shutil.which("tesseract"):
-    st.error("❌ Error: Tesseract no está instalado.")
+    st.error("❌ Error Crítico: Tesseract no está instalado.")
     st.stop()
 
 # --- BARRA LATERAL ---
-st.sidebar.header("⚙️ Tipo de Documento")
-modo_app = st.sidebar.radio(
-    "Selecciona:",
-    ["1. Facturas Regal Trading", "2. Declaración DUCA (Aduanas)"]
-)
+with st.sidebar:
+    st.header("⚙️ Configuración")
+    
+    # Selector de Motor
+    modo_app = st.radio(
+        "Selecciona el Motor:",
+        ["1. Regal Trading (Tesseract V16)", 
+         "2. DUCA Aduanas (Tesseract V24)", 
+         "3. IA Gemini (Para casos difíciles)"]
+    )
+    
+    st.divider()
+    
+    # API Key para Modo 3
+    if modo_app == "3. IA Gemini (Para casos difíciles)":
+        api_key = st.text_input("🔑 Google API Key", type="password")
+        st.caption("[Conseguir Key Gratis](https://aistudio.google.com/app/apikey)")
 
 # ==============================================================================
-# 🧩 MÓDULO 1: REGAL TRADING (Versión V16 - Estable)
+# 🧩 MÓDULO 1: REGAL TRADING (Tesseract - Lógica V16 Probada)
 # ==============================================================================
 def clean_text_block(text):
     if not text: return ""
@@ -113,6 +128,8 @@ def extract_header_regal(full_text):
     data['Fecha'] = date.group(1) if date else ""
     orden = re.search(r'(?:ORDER|ORDEN).*?[:#]\s*(\d+)', full_text, re.IGNORECASE)
     data['Orden'] = orden.group(1) if orden else ""
+    ref = re.search(r'(?:FILE|REF)\s*[:.,]?\s*([A-Z0-9-]+)', full_text, re.IGNORECASE)
+    data['Ref'] = ref.group(1) if ref else ""
     sold = re.search(r'SOLD TO/VENDIDO A:(.*?)(?=SHIP TO|124829)', full_text, re.DOTALL | re.IGNORECASE)
     data['Vendido A'] = clean_text_block(sold.group(1)) if sold else ""
     ship = re.search(r'SHIP TO/EMBARCADO A:(.*?)(?=PAYMENT|DUE DATE|PAGE)', full_text, re.DOTALL | re.IGNORECASE)
@@ -126,104 +143,96 @@ def is_duplicate(image):
     return bool(re.search(r'Duplicado', txt, re.IGNORECASE))
 
 # ==============================================================================
-# 🧩 MÓDULO 2: EXTRACTOR DUCA (CORREGIDO Y LIMPIO)
+# 🧩 MÓDULO 2: EXTRACTOR DUCA (Tesseract - Lógica V24 Probada)
 # ==============================================================================
-
 def extract_duca_header(full_text):
-    """Extrae datos generales de la DUCA"""
     header = {}
-    
-    # 1. Referencia (Campo 2)
-    # Buscamos números grandes después de "Referencia"
-    ref = re.search(r'Referencia.*?(\d{8,})', full_text, re.DOTALL)
-    header['Referencia'] = ref.group(1) if ref else ""
-    
-    # 2. Fecha (Campo 3)
+    ref = re.search(r'Referencia[\s\S]*?(\d{8,})', full_text)
+    header['Referencia'] = ref.group(1) if ref else "ND"
     fecha = re.search(r'(\d{2}/\d{2}/\d{4})', full_text)
-    header['Fecha'] = fecha.group(1) if fecha else ""
-    
-    # 3. Declarante (Campo 10)
+    header['Fecha'] = fecha.group(1) if fecha else "ND"
     decl = re.search(r'Nombre.*?Declarante.*?\n(.*?)\n', full_text, re.IGNORECASE)
     header['Declarante'] = decl.group(1).replace('"','').strip() if decl else ""
-    
     return header
 
 def extract_duca_items(full_text):
-    """Extrae items de DUCA limpiando la basura del OCR (comillas, comas)"""
     items = []
-    
-    # LIMPIEZA PREVIA IMPORTANTE
-    # Quitamos comillas dobles y comas raras que el OCR pone en la tabla
     clean_txt = full_text.replace('"', ' ').replace("'", "")
-    
-    # Dividir por "22. Item"
     blocks = re.split(r'22\.\s*Item', clean_txt)
     
-    for i, block in enumerate(blocks[1:]): # Ignorar bloque 0 (encabezado)
+    for i, block in enumerate(blocks[1:]):
         try:
             item_data = {}
-            
-            # --- 1. DESCRIPCIÓN (Campo 29) ---
-            # Buscamos texto después de "29. Descripción Comercial"
-            # y antes de "30. Valor FOB" o cualquier número de campo "30."
             desc_match = re.search(r'29\.\s*Descripci.*?Comercial(.*?)(?=30\.|Valor FOB)', block, re.DOTALL | re.IGNORECASE)
-            
-            if desc_match:
-                raw_desc = desc_match.group(1)
-                # Limpiamos saltos de linea y basura numérica (códigos arancelarios que se cuelan)
-                clean_desc = re.sub(r'[\n\r]', ' ', raw_desc)
-                clean_desc = re.sub(r'^\s*[:\.]?\s*', '', clean_desc) # Quitar dos puntos al inicio
-                item_data['Descripción'] = clean_desc.strip()
-            else:
-                item_data['Descripción'] = "No detectada"
-
-            # --- 2. VALOR FOB (Campo 30) ---
-            # Buscamos el número decimal después de "30. Valor FOB"
+            if not desc_match or len(desc_match.group(1)) < 3:
+                desc_match = re.search(r'\d{8}[\s\n]+([A-Za-z].*?)(?=\n)', block)
+            desc_final = clean_text_block(desc_match.group(1)) if desc_match else "No detectada"
             fob_match = re.search(r'30\.\s*Valor.*?FOB.*?([\d,]+\.\d{2})', block, re.DOTALL | re.IGNORECASE)
-            item_data['Valor FOB'] = fob_match.group(1) if fob_match else "0.00"
-            
-            # --- 3. TOTAL (Campo 38) ---
-            # Buscamos el número decimal después de "38. Total"
             total_match = re.search(r'38\.\s*Total.*?([\d,]+\.\d{2})', block, re.DOTALL | re.IGNORECASE)
-            
-            # Si no encuentra etiqueta, buscamos el último precio del bloque
-            if total_match:
-                item_data['Total'] = total_match.group(1)
-            else:
-                # Fallback: Buscar todos los precios y tomar el último
+            if not total_match:
                 all_prices = re.findall(r'([\d,]+\.\d{2})', block)
-                item_data['Total'] = all_prices[-1] if all_prices else "0.00"
+                total_val = all_prices[-1] if all_prices else "0.00"
+            else:
+                total_val = total_match.group(1)
 
             item_data['Item #'] = i + 1
+            item_data['Descripción'] = desc_final
+            item_data['Valor FOB'] = fob_match.group(1) if fob_match else "0.00"
+            item_data['Total'] = total_val
             items.append(item_data)
-            
-        except Exception:
-            continue
-            
+        except: continue
     return items
 
+# ==============================================================================
+# 🧩 MÓDULO 3: IA GEMINI (COMODÍN INTELIGENTE)
+# ==============================================================================
+def process_with_gemini(image, key):
+    genai.configure(api_key=key)
+    model = genai.GenerativeModel('gemini-1.5-flash') # Modelo Rápido
+    
+    prompt = """
+    Analiza esta factura o documento aduanal y extrae datos en JSON.
+    
+    REGLAS:
+    1. Si ves 'Duplicado' arriba, marca "is_duplicate": true.
+    2. Cabecera: Factura, Fecha, Orden, Referencia, Cliente (Sold To), Envio (Ship To).
+    3. Items: Extrae la tabla. Si la descripción invade la columna de código, corrígelo.
+       - Ignora números sueltos que no sean productos reales.
+       - Corrige OCR (ej: si el código empieza con 'A' y es un número, es '4').
+    
+    JSON Output:
+    {
+        "is_duplicate": false,
+        "header": {"invoice": "", "date": "", "order": "", "customer": ""},
+        "items": [
+            {"qty": "", "desc": "", "code": "", "unit_price": "", "total": ""}
+        ]
+    }
+    """
+    try:
+        response = model.generate_content([prompt, image])
+        clean_json = response.text.replace("```json", "").replace("```", "").strip()
+        return json.loads(clean_json)
+    except Exception as e:
+        return {"error": str(e)}
+
 # ==========================================
-# 🖥️ INTERFAZ PRINCIPAL
+# 🖥️ LÓGICA PRINCIPAL
 # ==========================================
 
 uploaded_files = st.file_uploader("Sube tus archivos PDF", type=["pdf"], accept_multiple_files=True)
 
 if uploaded_files:
     
-    # ---------------------------------------------------------
-    # MODO 1: REGAL TRADING
-    # ---------------------------------------------------------
-    if modo_app == "1. Facturas Regal Trading":
-        st.info("ℹ️ Modo: Facturas Comerciales.")
+    # ------------------ MODO 1: REGAL (TESSERACT) ------------------
+    if "Regal" in modo_app:
         if st.button("🚀 Extraer Regal"):
             all_data = []
             bar = st.progress(0)
             for idx, f in enumerate(uploaded_files):
                 try:
                     images = convert_from_bytes(f.read(), dpi=300)
-                    header = {}
-                    file_items = []
-                    pg_count = 0
+                    header = {}; file_items = []; pg_count = 0
                     for i, img in enumerate(images):
                         if is_duplicate(img): continue
                         if pg_count == 0:
@@ -235,74 +244,79 @@ if uploaded_files:
                     
                     if file_items:
                         for it in file_items:
-                            row = header.copy()
-                            row.update(it)
-                            row['Archivo'] = f.name
+                            row = header.copy(); row.update(it); row['Archivo'] = f.name
                             all_data.append(row)
                 except Exception as e: st.error(f"Error {f.name}: {e}")
                 bar.progress((idx+1)/len(uploaded_files))
             
             if all_data:
                 df = pd.DataFrame(all_data)
+                cols = ['Archivo', 'Factura', 'Fecha', 'Orden', 'Ref', 'Vendido A', 'Embarcado A', 'Cantidad', 'Descripción', 'UPC', 'Precio Unit.', 'Total']
+                final_cols = [c for c in cols if c in df.columns]
                 buffer = io.BytesIO()
                 with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-                    df.to_excel(writer, index=False)
+                    df[final_cols].to_excel(writer, index=False)
+                    writer.sheets['Sheet1'].set_column('H:H', 50)
                 st.success("✅ Listo")
                 st.download_button("📥 Excel Regal", buffer.getvalue(), "Regal_Report.xlsx")
 
-    # ---------------------------------------------------------
-    # MODO 2: DUCA ADUANAS (CORREGIDO)
-    # ---------------------------------------------------------
-    elif modo_app == "2. Declaración DUCA (Aduanas)":
-        st.info("ℹ️ Modo: Documentos de Aduana (DUCA Simplificada).")
-        
+    # ------------------ MODO 2: DUCA (TESSERACT) ------------------
+    elif "DUCA" in modo_app:
         if st.button("🚢 Extraer DUCA"):
-            all_duca_data = []
+            all_duca = []
             bar = st.progress(0)
-            
             for idx, f in enumerate(uploaded_files):
                 try:
-                    # DUCA necesita texto completo
                     images = convert_from_bytes(f.read(), dpi=300)
-                    
                     header_duca = {}
-                    
                     for i, img in enumerate(images):
-                        # Psm 4 para mantener el orden de lectura
-                        full_text = pytesseract.image_to_string(img, lang='spa', config='--psm 4')
-                        
-                        # Extraer cabecera (Pág 1)
-                        if i == 0:
-                            # AQUÍ ESTABA EL ERROR DE NOMBRE, YA CORREGIDO:
-                            header_duca = extract_duca_header(full_text)
-                        
-                        # Extraer items
-                        page_items = extract_duca_items(full_text)
-                        
-                        for item in page_items:
-                            row = header_duca.copy()
-                            row.update(item)
-                            row['Página'] = i + 1
-                            row['Archivo'] = f.name
-                            all_duca_data.append(row)
-                            
-                except Exception as e:
-                    st.error(f"Error en {f.name}: {e}")
-                
+                        txt = pytesseract.image_to_string(img, lang='spa', config='--psm 4')
+                        if i == 0: header_duca = extract_duca_header(txt)
+                        items = extract_duca_items(txt)
+                        for it in items:
+                            row = header_duca.copy(); row.update(it); row['Archivo'] = f.name
+                            all_duca.append(row)
+                except Exception as e: st.error(f"Error {f.name}: {e}")
                 bar.progress((idx+1)/len(uploaded_files))
             
-            if all_duca_data:
-                df_duca = pd.DataFrame(all_duca_data)
-                st.write("### Vista Previa DUCA")
-                st.dataframe(df_duca.head(), use_container_width=True)
-                
+            if all_duca:
+                df = pd.DataFrame(all_duca)
                 buffer = io.BytesIO()
                 with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-                    df_duca.to_excel(writer, index=False)
-                    ws = writer.sheets['Sheet1']
-                    ws.set_column('E:E', 60) # Columna descripción ancha
+                    df.to_excel(writer, index=False)
+                    writer.sheets['Sheet1'].set_column('F:F', 50)
+                st.success("✅ DUCA Lista")
+                st.download_button("📥 Excel DUCA", buffer.getvalue(), "DUCA_Report.xlsx")
+
+    # ------------------ MODO 3: IA GEMINI ------------------
+    elif "Gemini" in modo_app:
+        if not api_key: st.warning("⚠️ Ingresa tu API Key en el menú lateral."); st.stop()
+        
+        if st.button("✨ Procesar con IA"):
+            ai_data = []
+            bar = st.progress(0)
+            for idx, f in enumerate(uploaded_files):
+                try:
+                    images = convert_from_bytes(f.read(), dpi=200) # DPI menor para IA (más rápido)
+                    header_ai = {}
+                    for i, img in enumerate(images):
+                        res = process_with_gemini(img, api_key)
+                        if "error" in res: st.error(res['error']); continue
+                        if res.get("is_duplicate"): continue
+                        
+                        if not header_ai: header_ai = res.get("header", {})
+                        
+                        for item in res.get("items", []):
+                            row = header_ai.copy(); row.update(item); row['Archivo'] = f.name
+                            ai_data.append(row)
+                        time.sleep(1)
+                except Exception as e: st.error(f"Error {f.name}: {e}")
+                bar.progress((idx+1)/len(uploaded_files))
                 
-                st.success("✅ DUCA Procesada")
-                st.download_button("📥 Descargar Excel DUCA", buffer.getvalue(), "Reporte_DUCA.xlsx")
-            else:
-                st.warning("No se encontraron items DUCA. Asegúrate que el PDF sea legible.")
+            if ai_data:
+                df = pd.DataFrame(ai_data)
+                buffer = io.BytesIO()
+                with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+                    df.to_excel(writer, index=False)
+                st.success("✅ IA Finalizada")
+                st.download_button("📥 Excel IA", buffer.getvalue(), "IA_Report.xlsx")
