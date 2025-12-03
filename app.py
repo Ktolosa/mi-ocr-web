@@ -8,8 +8,8 @@ import shutil
 import re
 
 # --- CONFIGURACIÓN ---
-st.set_page_config(page_title="Sistema OCR Dual", layout="wide")
-st.title("🧰 Sistema OCR Multiusos")
+st.set_page_config(page_title="Sistema OCR Dual V18", layout="wide")
+st.title("🧰 Sistema OCR Multiusos (General Optimizado)")
 
 if not shutil.which("tesseract"):
     st.error("❌ Error: Tesseract no está instalado.")
@@ -19,11 +19,11 @@ if not shutil.which("tesseract"):
 st.sidebar.header("⚙️ Configuración")
 modo_app = st.sidebar.radio(
     "Selecciona la Herramienta:",
-    ["1. Extractor Regal Trading (Específico)", "2. OCR General (Réplica Visual)"]
+    ["1. Extractor Regal Trading (Específico)", "2. OCR General (Réplica Limpia)"]
 )
 
 # ==============================================================================
-# 🧩 MÓDULO 1: HERRAMIENTAS REGAL TRADING (Lógica V16)
+# 🧩 MÓDULO 1: HERRAMIENTAS REGAL TRADING (Tu versión V16 intacta)
 # ==============================================================================
 
 def clean_text_block(text):
@@ -55,7 +55,6 @@ def extract_items_regal(image):
     X_UPC_END = w * 0.72
     X_PRICE_END = w * 0.88
     
-    # 1. Detectar candidatos (Números a la izquierda)
     candidates = []
     for i in range(n_boxes):
         text = d['text'][i].strip()
@@ -66,8 +65,6 @@ def extract_items_regal(image):
         if cx < X_QTY_LIMIT and re.match(r'^[0-9.,]+$', text):
             if d['height'][i] > 8: candidates.append({'y': cy, 'qty': text})
 
-    # 2. Validación (Modo adaptativo)
-    # Intentamos filtrar estrictamente primero
     valid_anchors = []
     for cand in candidates:
         row_y = cand['y']
@@ -80,11 +77,9 @@ def extract_items_regal(image):
                     has_price = True; break
         if has_price: valid_anchors.append(cand)
     
-    # Si el modo estricto falló (0 items), usamos el modo relajado (todos los candidatos)
     if not valid_anchors and candidates:
         valid_anchors = candidates
 
-    # Filtrar duplicados
     valid_anchors.sort(key=lambda k: k['y'])
     final_anchors = []
     if valid_anchors:
@@ -92,7 +87,6 @@ def extract_items_regal(image):
         for anc in valid_anchors[1:]:
             if anc['y'] - final_anchors[-1]['y'] > 15: final_anchors.append(anc)
 
-    # 3. Extraer texto
     items = []
     for idx, anchor in enumerate(final_anchors):
         y_top = anchor['y'] - 30 
@@ -150,58 +144,83 @@ def is_duplicate(image):
     return bool(re.search(r'Duplicado', txt, re.IGNORECASE))
 
 # ==============================================================================
-# 🧩 MÓDULO 2: OCR GENERAL (RÉPLICA VISUAL)
+# 🧩 MÓDULO 2: OCR GENERAL MEJORADO (COMPRESIÓN DE ESPACIOS)
 # ==============================================================================
 
-def generate_spatial_excel(images):
+def generate_compact_spatial_excel(images):
     """
-    Crea un Excel mapeando cada palabra a una celda basada en sus coordenadas X,Y.
-    El resultado se ve visualmente igual al PDF.
+    Crea una réplica visual pero elimina el exceso de filas y columnas vacías.
+    Agrupa elementos cercanos.
     """
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
         workbook = writer.book
-        # Estilo para texto pequeño y alineado
-        cell_format = workbook.add_format({'text_wrap': False, 'valign': 'top', 'font_size': 10})
+        cell_fmt = workbook.add_format({'text_wrap': False, 'valign': 'top', 'font_size': 10})
         
         for i, image in enumerate(images):
+            # 1. Obtener datos detallados
+            # --psm 6 ayuda a leer líneas completas
+            data = pytesseract.image_to_data(image, output_type=Output.DICT, lang='spa', config='--psm 6')
+            
+            # Crear DataFrame para manipular coordenadas fácilmente
+            df = pd.DataFrame(data)
+            
+            # Filtrar basura (texto vacío o confianza -1)
+            df = df[df.text.str.strip() != ""]
+            df = df.dropna(subset=['text'])
+            
+            if df.empty: continue
+
+            # 2. AGRUPACIÓN DE FILAS (Row Snapping)
+            # Dividimos la posición Y entre 20. Esto significa que todo texto
+            # dentro de un rango de 20px de altura caerá en la misma fila de Excel.
+            ROW_HEIGHT_PX = 20
+            df['row_idx'] = (df['top'] // ROW_HEIGHT_PX).astype(int)
+            
+            # Normalizar filas (Para que empiece en la fila 0 de Excel)
+            min_row = df['row_idx'].min()
+            df['row_idx'] = df['row_idx'] - min_row
+            
+            # 3. AGRUPACIÓN DE COLUMNAS (Column Compression)
+            # Dividimos la posición X. Un valor más alto aquí (ej: 25)
+            # reduce más los espacios en blanco horizontales.
+            COL_WIDTH_PX = 18 
+            df['col_idx'] = (df['left'] // COL_WIDTH_PX).astype(int)
+            
+            # Normalizar columnas (Para que empiece en la columna A)
+            min_col = df['col_idx'].min()
+            df['col_idx'] = df['col_idx'] - min_col
+
+            # 4. Escribir en Excel
             sheet_name = f"Pagina_{i+1}"
             worksheet = workbook.add_worksheet(sheet_name)
             
-            # Obtener datos con coordenadas
-            data = pytesseract.image_to_data(image, output_type=Output.DICT, lang='spa')
-            n_boxes = len(data['text'])
+            # Diccionario para evitar superposiciones
+            # Si dos palabras caen en la misma celda, las concatenamos
+            grid_map = {}
             
-            # Factores de escala (Pixel -> Celda Excel)
-            # Ajustar estos valores cambia qué tan "apretado" queda el Excel
-            SCALE_Y = 16  # Cada 16 pixeles de altura es 1 Fila
-            SCALE_X = 9   # Cada 9 pixeles de ancho es 1 Columna
-            
-            # Diccionario para evitar sobreescritura
-            grid = {}
-            
-            for j in range(n_boxes):
-                text = data['text'][j].strip()
-                if not text: continue
+            for _, row in df.iterrows():
+                r, c = row['row_idx'], row['col_idx']
+                txt = str(row['text'])
                 
-                # Calcular coordenadas Excel
-                row = int(data['top'][j] / SCALE_Y)
-                col = int(data['left'][j] / SCALE_X)
-                
-                # Si la celda está ocupada, mover a la derecha
-                while (row, col) in grid:
-                    col += 1
-                
-                grid[(row, col)] = text
-                worksheet.write(row, col, text, cell_format)
+                if (r, c) in grid_map:
+                    # Si ya hay texto, agregamos un espacio y concatenamos
+                    # Esto arregla frases que se partieron
+                    grid_map[(r, c)] += " " + txt
+                else:
+                    grid_map[(r, c)] = txt
             
-            # Hacer las columnas estrechas para simular una hoja milimétrica
-            worksheet.set_column(0, 250, 1.2)
+            # Volcar el mapa al Excel
+            for (r, c), text in grid_map.items():
+                worksheet.write(r, c, text, cell_fmt)
+            
+            # Ajuste estético de columnas (Ancho fijo pequeño para simular grilla)
+            worksheet.set_column(0, df['col_idx'].max(), 2.5) 
             
     return output
 
 # ==========================================
-# 🖥️ INTERFAZ PRINCIPAL (LÓGICA DE MODOS)
+# 🖥️ INTERFAZ PRINCIPAL
 # ==========================================
 
 uploaded_files = st.file_uploader("Sube tus archivos PDF", type=["pdf"], accept_multiple_files=True)
@@ -212,7 +231,7 @@ if uploaded_files:
     # MODO 1: REGAL TRADING (ESTRUCTURADO)
     # ---------------------------------------------------------
     if modo_app == "1. Extractor Regal Trading (Específico)":
-        st.info("ℹ️ Modo activo: Extracción de tablas y datos específicos de Regal Trading.")
+        st.info("ℹ️ Modo activo: Tablas estructuradas para Regal Trading.")
         
         if st.button("🚀 Extraer Datos (Regal)"):
             all_data = []
@@ -251,9 +270,6 @@ if uploaded_files:
             
             if all_data:
                 df = pd.DataFrame(all_data)
-                st.write("### Vista Previa:")
-                st.dataframe(df.head(), use_container_width=True)
-                
                 cols = ['Archivo', 'Factura', 'Fecha', 'Orden', 'Vendido A', 'Embarcado A', 
                         'Cantidad', 'Descripción', 'UPC', 'Precio Unit.', 'Total']
                 final_cols = [c for c in cols if c in df.columns]
@@ -267,66 +283,40 @@ if uploaded_files:
                 st.download_button("📥 Descargar Reporte Regal", buffer.getvalue(), "Reporte_Regal.xlsx")
 
     # ---------------------------------------------------------
-    # MODO 2: OCR GENERAL (RÉPLICA VISUAL)
+    # MODO 2: OCR GENERAL (RÉPLICA LIMPIA)
     # ---------------------------------------------------------
-    elif modo_app == "2. OCR General (Réplica Visual)":
-        st.info("ℹ️ Modo activo: Réplica visual exacta. Crea un Excel que se ve igual al PDF (ideal para otros formatos).")
+    elif modo_app == "2. OCR General (Réplica Limpia)":
+        st.info("ℹ️ Modo activo: Réplica visual compacta (elimina espacios vacíos excesivos).")
         
         if st.button("✨ Generar Réplica Excel"):
-            with st.status("Generando réplica visual...", expanded=True) as status:
+            with st.status("Generando réplica optimizada...", expanded=True) as status:
                 try:
-                    # Usamos solo el primer archivo para este modo (o iteramos si quieres)
-                    # Aquí unimos todos en un solo excel con pestañas
-                    
                     master_buffer = io.BytesIO()
-                    with pd.ExcelWriter(master_buffer, engine='xlsxwriter') as writer:
-                        workbook = writer.book
-                        cell_fmt = workbook.add_format({'font_size': 9})
-                        
-                        for f in uploaded_files:
-                            f.seek(0) # Reiniciar puntero
-                            images = convert_from_bytes(f.read(), dpi=200)
-                            
-                            st.write(f"Procesando {f.name} ({len(images)} páginas)...")
-                            
-                            for i, img in enumerate(images):
-                                # Nombre hoja: Archivo_Pagina
-                                sheet_name = f"{f.name[:10]}_{i+1}"
-                                # Limpiar caracteres inválidos para excel sheet
-                                sheet_name = re.sub(r'[\[\]:*?/\\]', '', sheet_name)
-                                worksheet = workbook.add_worksheet(sheet_name)
-                                
-                                # OCR Data
-                                d = pytesseract.image_to_data(img, output_type=Output.DICT, lang='spa')
-                                
-                                # Mapeo Espacial (Pixel -> Celda)
-                                SCALE_Y = 15 # Ajusta altura
-                                SCALE_X = 8  # Ajusta ancho
-                                grid = {}
-                                
-                                for j in range(len(d['text'])):
-                                    txt = d['text'][j].strip()
-                                    if not txt: continue
-                                    
-                                    row = int(d['top'][j] / SCALE_Y)
-                                    col = int(d['left'][j] / SCALE_X)
-                                    
-                                    # Evitar colisión
-                                    while (row, col) in grid: col += 1
-                                    grid[(row, col)] = txt
-                                    
-                                    worksheet.write(row, col, txt, cell_fmt)
-                                
-                                # Ajuste visual de columnas
-                                worksheet.set_column(0, 200, 1.1) 
+                    
+                    # Procesamos para crear el excel
+                    # Nota: Para este modo iteramos archivo por archivo y generamos un ZIP o un solo Excel con muchas hojas
+                    # Aquí haremos un solo Excel multi-hoja
+                    
+                    # Recargamos punteros de archivos
+                    for f in uploaded_files: f.seek(0)
+                    
+                    # Como pdf2image necesita leer bytes, leemos el primero para el ejemplo o todos
+                    # Simplificación: Procesamos todos los archivos en un solo libro Excel
+                    
+                    all_images = []
+                    for f in uploaded_files:
+                        imgs = convert_from_bytes(f.read(), dpi=200)
+                        all_images.extend(imgs)
+                    
+                    excel_data = generate_compact_spatial_excel(all_images)
                     
                     status.update(label="¡Réplica Creada!", state="complete")
-                    st.success("✅ Se ha generado un Excel que imita la posición del texto original.")
+                    st.success("✅ Excel generado con espacios optimizados.")
                     
                     st.download_button(
-                        "📥 Descargar Réplica Visual", 
-                        master_buffer.getvalue(), 
-                        "Replica_Visual.xlsx"
+                        "📥 Descargar Réplica Compacta", 
+                        excel_data.getvalue(), 
+                        "Replica_General.xlsx"
                     )
                     
                 except Exception as e:
