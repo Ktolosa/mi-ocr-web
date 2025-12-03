@@ -8,27 +8,34 @@ import shutil
 import re
 
 # --- CONFIGURACIÓN ---
-st.set_page_config(page_title="Sistema OCR Aduana V22", layout="wide")
-st.title("🧰 Sistema de Extracción: Facturas & DUCA")
+st.set_page_config(page_title="Sistema OCR V23", layout="wide")
+st.title("🧰 Sistema de Extracción: Facturas & DUCA (V23)")
 
 if not shutil.which("tesseract"):
-    st.error("❌ Error: Tesseract no está instalado.")
+    st.error("❌ Error Crítico: Tesseract no está instalado.")
     st.stop()
 
 # --- BARRA LATERAL ---
 st.sidebar.header("⚙️ Tipo de Documento")
 modo_app = st.sidebar.radio(
     "Selecciona:",
-    ["1. Facturas Regal Trading (Comercial)", "2. Declaración DUCA (Aduanas)"]
+    ["1. Facturas Regal Trading", "2. Declaración DUCA (Aduanas)"]
 )
 
 # ==============================================================================
-# 🧩 MÓDULO 1: REGAL TRADING (Versión V16 - Estable)
+# 🛠️ UTILIDADES GENERALES
 # ==============================================================================
 def clean_text_block(text):
     if not text: return ""
     return " ".join(text.split())
 
+def clean_decimal(text):
+    if not text: return "0.00"
+    return re.sub(r'[^\d.]', '', text)
+
+# ==============================================================================
+# 🧩 MÓDULO 1: REGAL TRADING (ESTABLE)
+# ==============================================================================
 def clean_upc(text):
     if not text: return ""
     text = text.replace(" ", "").strip()
@@ -126,72 +133,79 @@ def is_duplicate(image):
     return bool(re.search(r'Duplicado', txt, re.IGNORECASE))
 
 # ==============================================================================
-# 🧩 MÓDULO 2: EXTRACTOR DUCA (CORREGIDO)
+# 🧩 MÓDULO 2: EXTRACTOR DUCA (BLINDADO)
 # ==============================================================================
 
+def extract_duca_header(full_text):
+    """Extrae cabecera de DUCA con seguridad."""
+    header = {}
+    try:
+        ref = re.search(r'Referencia[\s\S]*?(\d{8,})', full_text)
+        header['Referencia'] = ref.group(1) if ref else "ND"
+        
+        fecha = re.search(r'(\d{2}/\d{2}/\d{4})', full_text)
+        header['Fecha'] = fecha.group(1) if fecha else "ND"
+        
+        # Intentar buscar declarante
+        decl = re.search(r'Nombre.*?Declarante[:\s]*\n?(.*?)\n', full_text, re.IGNORECASE)
+        header['Declarante'] = decl.group(1) if decl else ""
+    except:
+        pass
+    return header
+
 def extract_duca_items(full_text):
-    """
-    Parsea la DUCA buscando bloques de items.
-    """
+    """Extrae items de DUCA con manejo de errores."""
     items = []
     
-    # Dividir por "22. Item"
-    blocks = re.split(r'22\.\s*Item', full_text)
+    # Normalizar texto para facilitar regex
+    clean_txt = full_text.replace('"', '') 
     
-    # Empezamos desde el bloque 1 (el 0 es basura del inicio)
-    for i, block in enumerate(blocks[1:]):
-        item_data = {}
-        
-        # 1. Descripción Comercial (Campo 29)
-        # Buscamos texto que esté después de "29. Descripción Comercial"
-        # y antes de la sección de valores (30. Valor FOB)
-        desc_match = re.search(r'29\.\s*Descripci.*?Comercial.*?\n(.*?)(?=\n|,|30\.)', block, re.DOTALL | re.IGNORECASE)
-        
-        # Fallback: A veces el OCR pone la descripción después del código arancelario grande
-        if not desc_match or len(desc_match.group(1)) < 3:
-             desc_match = re.search(r'\d{8}\s+\n(.*?)\n', block)
-             
-        # 2. Valor FOB (Campo 30)
-        # Buscamos números decimales cerca de "30. Valor FOB"
-        fob_match = re.search(r'30\.\s*Valor.*?FOB.*?\n.*?([\d,]+\.\d{2})', block, re.DOTALL | re.IGNORECASE)
-        
-        # 3. Total (Campo 38)
-        total_match = re.search(r'38\.\s*Total.*?\n.*?([\d,]+\.\d{2})', block, re.DOTALL | re.IGNORECASE)
-        # Si falla, buscamos el último precio del bloque
-        if not total_match:
-             prices = re.findall(r'[\d,]+\.\d{2}', block)
-             total_val = prices[-1] if prices else "0.00"
-        else:
-             total_val = total_match.group(1)
+    # Dividir por "22. Item" (o variantes comunes de OCR)
+    # Usamos un regex flexible para el separador
+    blocks = re.split(r'22\.\s*Item|22\.\s*ltem', clean_txt)
+    
+    for i, block in enumerate(blocks[1:]): # Saltamos el primero (basura inicial)
+        try:
+            item_data = {}
+            
+            # --- 1. DESCRIPCIÓN ---
+            # Buscamos la descripción comercial. 
+            # Suele estar después de un código arancelario (8 dígitos) o etiquetada como "Descripción"
+            desc_match = re.search(r'Descripci.*?Comercial.*?[\n:](.*?)(?=\n|30\.|Valor)', block, re.DOTALL | re.IGNORECASE)
+            
+            if not desc_match or len(desc_match.group(1)) < 3:
+                # Fallback: Buscar texto después de "1.000" (cuantía común) o códigos largos
+                desc_match = re.search(r'\d{8}[\s\n]+([A-Za-z].*?)(?=\n)', block)
+            
+            desc_final = clean_text_block(desc_match.group(1)) if desc_match else "No detectada"
 
-        # ASIGNACIÓN
-        desc_text = desc_match.group(1).strip() if desc_match else "No detectada"
-        # Limpiar comillas y basura de la descripción
-        desc_text = desc_text.replace('"', '').replace(',', '').strip()
-        
-        item_data['Item #'] = i + 1
-        item_data['Descripción'] = desc_text
-        item_data['Valor FOB'] = fob_match.group(1) if fob_match else "0.00"
-        item_data['Total'] = total_val
-        
-        items.append(item_data)
-        
+            # --- 2. VALOR FOB ---
+            # Buscamos "Valor FOB" seguido de un número
+            fob_match = re.search(r'Valor\s*FOB.*?([\d,]+\.\d{2})', block, re.DOTALL | re.IGNORECASE)
+            
+            # --- 3. TOTAL ---
+            # Buscamos "Total" al final del bloque
+            total_match = re.findall(r'Total.*?([\d,]+\.\d{2})', block, re.DOTALL | re.IGNORECASE)
+            
+            # Si no halla etiqueta "Total", buscamos el último monto monetario del bloque
+            if not total_match:
+                all_prices = re.findall(r'([\d,]+\.\d{2})', block)
+                total_val = all_prices[-1] if all_prices else "0.00"
+            else:
+                total_val = total_match[-1] # El último match suele ser el valor
+
+            # Asignar
+            item_data['Item #'] = i + 1
+            item_data['Descripción'] = desc_final
+            item_data['Valor FOB'] = fob_match.group(1) if fob_match else "0.00"
+            item_data['Total'] = total_val
+            
+            items.append(item_data)
+            
+        except Exception:
+            continue # Si un bloque falla, lo saltamos y seguimos con el otro
+            
     return items
-
-def extract_duca_header(full_text):
-    """Extrae datos generales de la DUCA"""
-    header = {}
-    
-    # Referencia (Campo 2)
-    ref = re.search(r'2\.\s*Referencia.*?\n\s*(\d+)', full_text, re.IGNORECASE)
-    if not ref: ref = re.search(r'Referencia\s*(\d+)', full_text)
-    header['Referencia'] = ref.group(1) if ref else ""
-    
-    # Fecha (Campo 3)
-    fecha = re.search(r'(\d{2}/\d{2}/\d{4})', full_text)
-    header['Fecha'] = fecha.group(1) if fecha else ""
-    
-    return header
 
 # ==========================================
 # 🖥️ INTERFAZ PRINCIPAL
@@ -204,7 +218,7 @@ if uploaded_files:
     # ---------------------------------------------------------
     # MODO 1: REGAL TRADING
     # ---------------------------------------------------------
-    if modo_app == "1. Facturas Regal Trading (Comercial)":
+    if modo_app == "1. Facturas Regal Trading":
         st.info("ℹ️ Modo: Facturas Comerciales.")
         if st.button("🚀 Extraer Regal"):
             all_data = []
@@ -242,7 +256,7 @@ if uploaded_files:
                 st.download_button("📥 Excel Regal", buffer.getvalue(), "Regal_Report.xlsx")
 
     # ---------------------------------------------------------
-    # MODO 2: DUCA ADUANAS (CORREGIDO)
+    # MODO 2: DUCA ADUANAS (BLINDADO)
     # ---------------------------------------------------------
     elif modo_app == "2. Declaración DUCA (Aduanas)":
         st.info("ℹ️ Modo: Documentos de Aduana (DUCA Simplificada).")
@@ -253,46 +267,54 @@ if uploaded_files:
             
             for idx, f in enumerate(uploaded_files):
                 try:
-                    # Leemos con DPI alto para ver bien los números
+                    # Usamos PDF bytes directamente
                     images = convert_from_bytes(f.read(), dpi=300)
                     
                     header_duca = {}
+                    file_items = []
                     
                     for i, img in enumerate(images):
-                        # Psm 4 para leer bloques de texto (importante para DUCA)
+                        # Psm 4: Lee texto en orden de columna (mejor para DUCA)
                         full_text = pytesseract.image_to_string(img, lang='spa', config='--psm 4')
                         
-                        # Extraer cabecera solo de la pág 1
+                        # Extraer cabecera si es pág 1
                         if i == 0:
                             header_duca = extract_duca_header(full_text)
                         
-                        # Extraer items de esta página
+                        # Extraer items con protección de errores
                         page_items = extract_duca_items(full_text)
-                        
-                        for item in page_items:
+                        file_items.extend(page_items)
+                    
+                    if file_items:
+                        for item in file_items:
                             row = header_duca.copy()
                             row.update(item)
-                            row['Página'] = i + 1
                             row['Archivo'] = f.name
                             all_duca_data.append(row)
+                    else:
+                        # Si no halló items, intentamos al menos guardar la cabecera
+                        if header_duca:
+                            header_duca['Archivo'] = f.name
+                            header_duca['Error'] = "No se detectaron items"
+                            all_duca_data.append(header_duca)
                             
                 except Exception as e:
-                    st.error(f"Error en {f.name}: {e}")
+                    st.error(f"Error procesando {f.name}: {e}")
                 
                 bar.progress((idx+1)/len(uploaded_files))
             
             if all_duca_data:
                 df_duca = pd.DataFrame(all_duca_data)
-                st.write("### Vista Previa DUCA")
+                st.write("### Vista Previa:")
                 st.dataframe(df_duca.head(), use_container_width=True)
                 
                 buffer = io.BytesIO()
                 with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
                     df_duca.to_excel(writer, index=False)
                     ws = writer.sheets['Sheet1']
-                    ws.set_column('F:F', 50) 
+                    ws.set_column('A:Z', 20)
                 
                 st.success("✅ DUCA Procesada")
                 st.download_button("📥 Descargar Excel DUCA", buffer.getvalue(), "Reporte_DUCA.xlsx")
             else:
-                st.warning("No se encontraron items DUCA.")
+                st.warning("No se pudo extraer información.")
