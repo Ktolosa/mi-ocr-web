@@ -8,8 +8,8 @@ import shutil
 import re
 
 # --- CONFIGURACIÓN ---
-st.set_page_config(page_title="Sistema OCR Dual V19", layout="wide")
-st.title("🧰 Sistema OCR Multiusos (Compacto)")
+st.set_page_config(page_title="Sistema OCR V20", layout="wide")
+st.title("🧰 Sistema OCR Multiusos (Con Agrupación de Frases)")
 
 if not shutil.which("tesseract"):
     st.error("❌ Error: Tesseract no está instalado.")
@@ -19,7 +19,7 @@ if not shutil.which("tesseract"):
 st.sidebar.header("⚙️ Configuración")
 modo_app = st.sidebar.radio(
     "Selecciona la Herramienta:",
-    ["1. Extractor Regal Trading (Específico)", "2. OCR General (Compacto y Limpio)"]
+    ["1. Extractor Regal Trading (Específico)", "2. OCR General (Frases Completas)"]
 )
 
 # ==============================================================================
@@ -144,77 +144,85 @@ def is_duplicate(image):
     return bool(re.search(r'Duplicado', txt, re.IGNORECASE))
 
 # ==============================================================================
-# 🧩 MÓDULO 2: OCR GENERAL (LÓGICA COMPACTA SIN HUECOS)
+# 🧩 MÓDULO 2: OCR GENERAL INTELIGENTE (AGRUPACIÓN DE FRASES)
 # ==============================================================================
 
-def generate_compact_excel(images):
-    """
-    Agrupa el texto en líneas y lo escribe secuencialmente en Excel.
-    Sin columnas vacías intermedias.
-    """
+def generate_smart_excel(images):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
         workbook = writer.book
         cell_fmt = workbook.add_format({'text_wrap': False, 'valign': 'top', 'font_size': 10})
         
         for i, image in enumerate(images):
-            # 1. Obtener datos con cajas
-            # --psm 6 para asumir bloque de texto uniforme
-            d = pytesseract.image_to_data(image, output_type=Output.DICT, lang='spa', config='--psm 6')
-            n_boxes = len(d['text'])
+            # 1. Obtener datos detallados
+            # --psm 6 es clave para mantener la estructura de líneas
+            data = pytesseract.image_to_data(image, output_type=Output.DICT, lang='spa', config='--psm 6')
+            n_boxes = len(data['text'])
             
-            # Recolectar palabras válidas con sus coordenadas
+            # Recolectar palabras
             words = []
             for j in range(n_boxes):
-                txt = d['text'][j].strip()
+                txt = data['text'][j].strip()
                 if not txt: continue
                 words.append({
                     'text': txt,
-                    'top': d['top'][j],
-                    'left': d['left'][j],
-                    'width': d['width'][j],
-                    'height': d['height'][j]
+                    'top': data['top'][j],
+                    'left': data['left'][j],
+                    'width': data['width'][j],
+                    'right': data['left'][j] + data['width'][j]
                 })
             
             if not words: continue
 
-            # 2. AGRUPAR POR LÍNEAS (Clustering Vertical)
-            # Ordenar por posición Y
+            # 2. AGRUPAR POR FILAS (Y-Axis Clustering)
             words.sort(key=lambda k: k['top'])
-            
             lines = []
-            current_line = []
+            current_line = [words[0]]
             
-            if words:
-                current_line.append(words[0])
-                
-                for w in words[1:]:
-                    prev = current_line[-1]
-                    # Si la diferencia vertical es pequeña (<15px), es la misma línea
-                    if abs(w['top'] - prev['top']) < 15:
-                        current_line.append(w)
-                    else:
-                        # Nueva línea detectada
-                        lines.append(current_line)
-                        current_line = [w]
-                
-                lines.append(current_line) # Agregar la última
+            for w in words[1:]:
+                prev = current_line[-1]
+                # Si la diferencia vertical es pequeña (<15px), es la misma línea
+                if abs(w['top'] - prev['top']) < 15:
+                    current_line.append(w)
+                else:
+                    lines.append(current_line)
+                    current_line = [w]
+            lines.append(current_line)
 
-            # 3. ESCRIBIR EN EXCEL
+            # 3. CONSTRUIR CELDAS CON FRASES (X-Axis Clustering)
             sheet_name = f"Pagina_{i+1}"
             worksheet = workbook.add_worksheet(sheet_name)
             
             for row_idx, line in enumerate(lines):
-                # Ordenar la línea de izquierda a derecha (X)
+                # Ordenar de izquierda a derecha
                 line.sort(key=lambda k: k['left'])
                 
                 col_idx = 0
-                for word_obj in line:
-                    worksheet.write(row_idx, col_idx, word_obj['text'], cell_fmt)
-                    col_idx += 1
+                current_phrase = line[0]['text']
+                last_right = line[0]['right']
+                
+                # Umbral de "imán": Si están a menos de 40px, es la misma frase
+                GAP_THRESHOLD = 40 
+                
+                for w in line[1:]:
+                    gap = w['left'] - last_right
+                    
+                    if gap < GAP_THRESHOLD:
+                        # Brecha pequeña -> Concatenar a la misma celda
+                        current_phrase += " " + w['text']
+                    else:
+                        # Brecha grande -> Escribir celda y saltar a la siguiente
+                        worksheet.write(row_idx, col_idx, current_phrase, cell_fmt)
+                        col_idx += 1
+                        current_phrase = w['text'] # Iniciar nueva frase
+                    
+                    last_right = w['right']
+                
+                # Escribir el último remanente de la línea
+                worksheet.write(row_idx, col_idx, current_phrase, cell_fmt)
             
-            # Ajustar ancho de columnas para que se lea bien
-            worksheet.set_column(0, 50, 15)
+            # Ajuste de columnas
+            worksheet.set_column(0, 50, 20)
             
     return output
 
@@ -227,7 +235,7 @@ uploaded_files = st.file_uploader("Sube tus archivos PDF", type=["pdf"], accept_
 if uploaded_files:
     
     # ---------------------------------------------------------
-    # MODO 1: REGAL TRADING (ESTRUCTURADO)
+    # MODO 1: REGAL TRADING
     # ---------------------------------------------------------
     if modo_app == "1. Extractor Regal Trading (Específico)":
         st.info("ℹ️ Modo activo: Tablas estructuradas para Regal Trading.")
@@ -245,7 +253,6 @@ if uploaded_files:
                     
                     for i, img in enumerate(images):
                         if is_duplicate(img): continue
-                        
                         if pg_count == 0:
                             txt = pytesseract.image_to_string(img, lang='spa')
                             header = extract_header_regal(txt)
@@ -282,31 +289,29 @@ if uploaded_files:
                 st.download_button("📥 Descargar Reporte Regal", buffer.getvalue(), "Reporte_Regal.xlsx")
 
     # ---------------------------------------------------------
-    # MODO 2: OCR GENERAL (COMPACTO)
+    # MODO 2: OCR GENERAL (FRASES COMPLETAS)
     # ---------------------------------------------------------
-    elif modo_app == "2. OCR General (Compacto y Limpio)":
-        st.info("ℹ️ Modo activo: Extrae todo el texto y lo organiza en filas continuas sin huecos.")
+    elif modo_app == "2. OCR General (Frases Completas)":
+        st.info("ℹ️ Modo activo: Agrupa palabras cercanas en la misma celda para evitar fragmentación.")
         
-        if st.button("✨ Generar Excel Compacto"):
-            with st.status("Procesando texto...", expanded=True) as status:
+        if st.button("✨ Generar Excel Inteligente"):
+            with st.status("Analizando geometría de palabras...", expanded=True) as status:
                 try:
-                    # Leemos todos los archivos
                     all_images = []
                     for f in uploaded_files:
                         f.seek(0)
                         imgs = convert_from_bytes(f.read(), dpi=200)
                         all_images.extend(imgs)
                     
-                    # Generamos Excel
-                    excel_data = generate_compact_excel(all_images)
+                    excel_data = generate_smart_excel(all_images)
                     
                     status.update(label="¡Listo!", state="complete")
-                    st.success("✅ Excel generado sin celdas vacías intermedias.")
+                    st.success("✅ Excel generado. Las frases ahora están unidas.")
                     
                     st.download_button(
-                        "📥 Descargar Excel Compacto", 
+                        "📥 Descargar Excel General", 
                         excel_data.getvalue(), 
-                        "OCR_General_Compacto.xlsx"
+                        "OCR_General_Smart.xlsx"
                     )
                     
                 except Exception as e:
