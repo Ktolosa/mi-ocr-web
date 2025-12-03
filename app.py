@@ -28,8 +28,7 @@ def analyze_image_with_gemini(image, api_key):
     """
     genai.configure(api_key=api_key)
     
-    # Usamos Gemini 1.5 Flash (Rápido y eficiente para documentos)
-    model = genai.GenerativeModel('gemini-1.5-flash')
+model = genai.GenerativeModel('gemini-pro')
     
     # El prompt maestro: Le damos instrucciones precisas de cómo queremos los datos
     prompt = """
@@ -203,3 +202,4 @@ if uploaded_files:
             st.balloons()
             st.success("✅ ¡Extracción Inteligente Completada!")
             st.download_button("📥 Descargar Excel", buffer.getvalue(), "Reporte_Regal_AI.xlsx")
+
