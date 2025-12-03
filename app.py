@@ -33,9 +33,10 @@ with st.sidebar:
     st.divider()
     
     # API Key para Modo 3
+    api_key = ""
     if modo_app == "3. IA Gemini (Para casos difíciles)":
         api_key = st.text_input("🔑 Google API Key", type="password")
-        st.caption("[Conseguir Key Gratis](https://aistudio.google.com/app/apikey)")
+        st.caption("Obtenla gratis en Google AI Studio")
 
 # ==============================================================================
 # 🧩 MÓDULO 1: REGAL TRADING (Tesseract - Lógica V16 Probada)
@@ -188,7 +189,11 @@ def extract_duca_items(full_text):
 # ==============================================================================
 def process_with_gemini(image, key):
     genai.configure(api_key=key)
-    model = genai.GenerativeModel('gemini-1.5-flash') # Modelo Rápido
+    # IMPORTANTE: Usamos un modelo compatible si el Flash falla o la librería es vieja
+    try:
+        model = genai.GenerativeModel('gemini-1.5-flash')
+    except:
+        model = genai.GenerativeModel('gemini-pro')
     
     prompt = """
     Analiza esta factura o documento aduanal y extrae datos en JSON.
@@ -196,9 +201,9 @@ def process_with_gemini(image, key):
     REGLAS:
     1. Si ves 'Duplicado' arriba, marca "is_duplicate": true.
     2. Cabecera: Factura, Fecha, Orden, Referencia, Cliente (Sold To), Envio (Ship To).
-    3. Items: Extrae la tabla. Si la descripción invade la columna de código, corrígelo.
-       - Ignora números sueltos que no sean productos reales.
-       - Corrige OCR (ej: si el código empieza con 'A' y es un número, es '4').
+    3. Items: Extrae la tabla. 
+       - Corrige OCR (ej: 'A' al inicio de UPC es '4').
+       - Si la descripción invade la columna de código, corrígelo.
     
     JSON Output:
     {
@@ -297,7 +302,7 @@ if uploaded_files:
             bar = st.progress(0)
             for idx, f in enumerate(uploaded_files):
                 try:
-                    images = convert_from_bytes(f.read(), dpi=200) # DPI menor para IA (más rápido)
+                    images = convert_from_bytes(f.read(), dpi=200)
                     header_ai = {}
                     for i, img in enumerate(images):
                         res = process_with_gemini(img, api_key)
