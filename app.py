@@ -1,114 +1,112 @@
 import streamlit as st
 import pytesseract
+from pytesseract import Output
 from pdf2image import convert_from_bytes
 import pandas as pd
 import io
 import shutil
-import re
 
 # --- CONFIGURACIÓN ---
-st.set_page_config(page_title="OCR Universal", layout="wide")
-st.title("📄 Digitalizador de Tablas (Formato Libre)")
+st.set_page_config(page_title="Replicador Visual PDF", layout="wide")
+st.title("🎨 Replicador Visual de Documentos")
 st.markdown("""
-Este sistema no busca palabras clave. **Intenta reconstruir la tabla visualmente**.
-Funciona detectando los espacios en blanco entre columnas.
+Este sistema utiliza **OCR Espacial**. 
+Toma las coordenadas (X, Y) de cada palabra en el PDF y las "dibuja" en las celdas de Excel 
+para mantener la posición visual original (Logos, tablas, direcciones, etc.).
 """)
 
-# --- VERIFICACIÓN DE SISTEMA ---
+# --- VERIFICACIÓN ---
 if not shutil.which("tesseract"):
     st.error("❌ Error: Tesseract no está instalado.")
     st.stop()
 
-# --- LÓGICA UNIVERSAL ---
-def extract_general_data(image):
-    """
-    Extrae texto intentando conservar la estructura de columnas
-    basada en espacios visuales.
-    """
-    # CONFIGURACIÓN CLAVE:
-    # --psm 6: Asume un bloque de texto uniforme (bueno para tablas)
-    # preserve_interword_spaces=1: NO borres los espacios grandes, los necesitamos
-    custom_config = r'--oem 3 --psm 6 -c preserve_interword_spaces=1'
+# --- LÓGICA DE REPLICACIÓN VISUAL ---
+def create_spatial_excel(images):
+    # Buffer para guardar el Excel en memoria
+    output = io.BytesIO()
     
-    raw_text = pytesseract.image_to_string(image, lang='spa', config=custom_config)
-    
-    rows = []
-    
-    # Procesar línea por línea
-    for line in raw_text.split('\n'):
-        line = line.strip()
-        if not line:
-            continue
-            
-        # EL TRUCO: Cortar cuando haya 2 o más espacios seguidos
-        # Esto separa "Descripción      $10.00" en ["Descripción", "$10.00"]
-        # pero mantiene "San Salvador" junto (porque solo tiene 1 espacio).
-        cells = re.split(r'\s{2,}', line)
-        rows.append(cells)
-    
-    return rows
-
-def process_pdf(file_bytes):
-    try:
-        images = convert_from_bytes(file_bytes)
-        all_data = []
+    # Creamos el Excel con el motor XlsxWriter (necesario para formato avanzado)
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        workbook = writer.book
         
-        # Procesamos las páginas
+        # Estilo para que el texto se ajuste y se vea limpio
+        fmt_text = workbook.add_format({'text_wrap': False, 'valign': 'top', 'font_size': 10})
+        
         for i, image in enumerate(images):
-            page_rows = extract_general_data(image)
+            sheet_name = f"Pagina_{i+1}"
+            worksheet = workbook.add_worksheet(sheet_name)
             
-            # Añadimos una marca de qué página es
-            for row in page_rows:
-                # Agregamos el número de página al principio de la fila
-                row.insert(0, f"Pág {i+1}")
-                all_data.append(row)
+            # 1. Obtener DATOS y COORDENADAS (No solo texto)
+            # Esto devuelve: left, top, width, height, conf, text
+            df = pytesseract.image_to_data(image, output_type=Output.DATAFRAME, lang='spa')
+            
+            # Limpiar datos vacíos o de baja confianza
+            df = df[df.conf != -1]
+            df = df[df.text.str.strip() != ""]
+            
+            # --- ALGORITMO DE MAPEO ESPACIAL ---
+            
+            # FACTORES DE ESCALA (La magia matemática)
+            # Un PDF suele tener ~1600 pixeles de ancho. Excel tiene columnas.
+            # Dividimos los pixeles para saber en qué fila/columna cae.
+            SCALE_Y = 15  # Cada 15 pixeles de altura es 1 Fila de Excel
+            SCALE_X = 8   # Cada 8 pixeles de ancho es 1 Columna de Excel
+            
+            # Diccionario para evitar sobreescribir celdas: {(fila, col): "texto"}
+            grid_map = {}
+            
+            for index, row in df.iterrows():
+                text = str(row['text']).strip()
+                if not text: continue
                 
-        return all_data
-        
-    except Exception as e:
-        return f"Error: {str(e)}"
+                # Calcular coordenadas en Excel
+                row_idx = int(row['top'] / SCALE_Y)
+                col_idx = int(row['left'] / SCALE_X)
+                
+                # Ajuste fino: Si la celda ya está ocupada, mover a la derecha
+                while (row_idx, col_idx) in grid_map:
+                    col_idx += 1
+                
+                # Guardar en el mapa
+                grid_map[(row_idx, col_idx)] = text
+                
+                # Escribir en Excel
+                worksheet.write(row_idx, col_idx, text, fmt_text)
+            
+            # --- TRUCO VISUAL ---
+            # Hacemos las columnas estrechas para simular una "grilla fina"
+            # Así el texto puede caer en cualquier lugar con precisión.
+            worksheet.set_column(0, 200, 1.2) # Ancho de columna muy pequeño
+            
+    return output
 
 # --- INTERFAZ ---
-uploaded_file = st.file_uploader("Sube cualquier PDF con tablas", type=["pdf"])
+uploaded_file = st.file_uploader("Sube PDF (Factura, Carta, Plano, etc.)", type=["pdf"])
 
 if uploaded_file is not None:
-    if st.button("🚀 Digitalizar Documento"):
+    if st.button("🎨 Generar Réplica en Excel"):
         
-        with st.status("Analizando estructura visual...", expanded=True) as status:
-            file_bytes = uploaded_file.read()
-            raw_data = process_pdf(file_bytes)
-            
-            if isinstance(raw_data, str): # Si devolvió un mensaje de error
-                status.update(label="Falló", state="error")
-                st.error(raw_data)
-            else:
-                status.update(label="¡Completado!", state="complete")
+        with st.status("Reconstruyendo diseño visual...", expanded=True) as status:
+            try:
+                # 1. Convertir PDF a imágenes
+                st.write("📸 Escaneando documento...")
+                images = convert_from_bytes(uploaded_file.read())
                 
-                # --- NORMALIZAR DATAFRAME ---
-                # Como cada fila puede tener diferente número de columnas, 
-                # buscamos la fila más larga para crear las columnas del Excel.
-                if raw_data:
-                    max_cols = max(len(row) for row in raw_data)
-                    column_names = [f"Columna {i}" for i in range(max_cols)]
-                    
-                    # Convertir a DataFrame rellenando huecos
-                    df = pd.DataFrame(raw_data, columns=column_names) # Pandas rellena auto los None
-                    
-                    st.success("✅ Datos extraídos respetando el formato visual")
-                    
-                    # Mostrar tabla
-                    st.dataframe(df, use_container_width=True)
-                    
-                    # Exportar a Excel
-                    buffer = io.BytesIO()
-                    with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-                        df.to_excel(writer, index=False, header=False) # Sin encabezados forzados
-                        
-                    st.download_button(
-                        label="📥 Descargar Excel (Formato Original)",
-                        data=buffer.getvalue(),
-                        file_name="tabla_digitalizada.xlsx",
-                        mime="application/vnd.ms-excel"
-                    )
-                else:
-                    st.warning("No se pudo extraer texto legible del documento.")
+                # 2. Procesar algoritmo espacial
+                st.write("📐 Calculando coordenadas y geometría...")
+                excel_data = create_spatial_excel(images)
+                
+                status.update(label="¡Diseño reconstruido!", state="complete")
+                st.success("✅ El Excel generado imita la posición visual de los textos.")
+                
+                # 3. Descargar
+                st.download_button(
+                    label="📥 Descargar Excel Visual",
+                    data=excel_data.getvalue(),
+                    file_name="Documento_Replicado.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+                
+            except Exception as e:
+                status.update(label="Error", state="error")
+                st.error(f"Error técnico: {e}")
