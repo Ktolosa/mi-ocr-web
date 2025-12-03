@@ -9,7 +9,7 @@ import re
 
 # --- CONFIGURACIÓN ---
 st.set_page_config(page_title="Extractor Regal Trading", layout="wide")
-st.title("📄 Extractor Especializado: Regal Trading")
+st.title("📄 Extractor Especializado: Regal Trading (V3)")
 
 # --- VERIFICACIÓN DE SISTEMA ---
 if not shutil.which("tesseract"):
@@ -17,149 +17,166 @@ if not shutil.which("tesseract"):
     st.stop()
 
 # ==========================================
-# 🧠 LÓGICA DE EXTRACCIÓN POR ZONAS (NUEVO)
+# 🛠️ UTILIDADES
 # ==========================================
+def clean_text(text):
+    return text.strip().replace('\n', ' ')
 
-def clean_decimal(text):
-    """Limpia símbolos de moneda y espacios para dejar solo números decimales"""
-    if not text: return "0.00"
-    # Quitar todo lo que no sea digito o punto
-    clean = re.sub(r'[^\d.]', '', text)
-    # Si tiene comas en vez de puntos, arreglar
-    return clean if clean else "0.00"
+def safe_extract(pattern, text, group=1):
+    try:
+        match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
+        if match:
+            return clean_text(match.group(group))
+    except:
+        pass
+    return ""
 
-def extract_items_by_coordinates(image):
-    """
-    Divide la imagen en columnas invisibles basadas en la posición X de cada palabra.
-    Esta función es específica para el formato visual de Regal Trading.
-    """
-    # 1. Obtener datos con coordenadas (Left, Top, Width, Text)
-    # --psm 6 asume un bloque de texto uniforme
+# ==========================================
+# 🧠 LÓGICA DE ENCABEZADO (REGEX MEJORADO)
+# ==========================================
+def extract_header_data_improved(full_text):
+    data = {}
+    
+    # 1. FACTURA (Buscamos el número de 6 dígitos asociado a Commercial Invoice o el símbolo #)
+    # Buscamos en todo el texto porque el # puede estar lejos del título
+    inv_match = re.search(r'(?:COMMERCIAL INVOICE|FACTURA).*?#\s*(\d{6})', full_text, re.DOTALL)
+    if not inv_match:
+        # Intento secundario: buscar solo el bloque flotante # 297107
+        inv_match = re.search(r'#\s*(\d{6})\s+[A-Z]', full_text)
+    data['Factura'] = inv_match.group(1) if inv_match else ""
+
+    # 2. FECHAS (Mejorado para capturar AGO/AUG)
+    # Patrón: Mes (3 letras) + Dia + Coma? + Año
+    date_pattern = r'([A-Za-z]{3}\s+\d{1,2}[,.]?\s+\d{4})'
+    
+    data['Fecha Emisión'] = safe_extract(r'DATE/FECHA\s*[:.,-]?\s*' + date_pattern, full_text)
+    data['Fecha Vencimiento'] = safe_extract(r'(?:DUE DATE|VENCIMIENTO)\s*[:.,-]?\s*' + date_pattern, full_text)
+
+    # 3. DATOS LOGÍSTICOS (Derecha)
+    data['Orden Compra'] = safe_extract(r'ORDER/ORDEN\s*#?\s*[:.,]?\s*(\d+)', full_text)
+    data['Referencia'] = safe_extract(r'FILE/REF\s*[:.,]?\s*([A-Z0-9]+)', full_text)
+    data['B/L'] = safe_extract(r'B/L#\s*[:.,]?\s*([A-Z0-9]+)', full_text)
+    data['Incoterm'] = safe_extract(r'INCOTERM\s*[:.,]?\s*([A-Z]+)', full_text)
+
+    # 4. DIRECCIONES (Usando delimitadores estrictos)
+    # SOLD TO: Captura todo hasta que encuentre "SHIP TO" o una fecha o número de referencia
+    sold_block = re.search(r'SOLD TO/VENDIDO A:(.*?)(?=SHIP TO|DATE/FECHA|124829)', full_text, re.DOTALL)
+    data['Vendido A'] = clean_text(sold_block.group(1)) if sold_block else ""
+
+    # SHIP TO: Captura todo hasta "PAYMENT TERMS" o "DATE"
+    ship_block = re.search(r'SHIP TO/EMBARCADO A:(.*?)(?=PAYMENT|DATE/FECHA|PAGE)', full_text, re.DOTALL)
+    data['Embarcado A'] = clean_text(ship_block.group(1)) if ship_block else ""
+
+    return data
+
+# ==========================================
+# 🧠 LÓGICA DE ITEMS (ESTRATEGIA BLOQUES VERTICALES)
+# ==========================================
+def extract_items_advanced(image):
+    # Obtenemos datos detallados con posición
     d = pytesseract.image_to_data(image, output_type=Output.DICT, lang='spa', config='--psm 6')
-    
     n_boxes = len(d['text'])
-    img_width, img_height = image.size
+    width, height = image.size
     
-    # Definimos los "Límites de las Columnas" basados en porcentajes del ancho de la página
-    # Según tu imagen:
-    # 0%  - 12% : Cantidad
-    # 12% - 55% : Modelo / Descripción
-    # 55% - 72% : País / UPC
-    # 72% - 85% : Precio Unitario
-    # 85% - 100%: Total
+    # 1. DEFINIR LÍMITES DE COLUMNAS (Basado en tu imagen)
+    # Ajusta estos porcentajes si el PDF cambia mucho de tamaño
+    X_QTY_LIMIT = width * 0.13    # Cantidad está en el primer 13%
+    X_DESC_START = width * 0.13   # Descripción empieza después de cantidad
+    X_DESC_END = width * 0.55     # Descripción termina al 55%
+    X_PRICE_START = width * 0.70  # Precio unitario empieza por el 70%
     
-    LIM_QTY = img_width * 0.12
-    LIM_DESC = img_width * 0.55
-    LIM_UPC = img_width * 0.72
-    LIM_PRICE = img_width * 0.88
+    # 2. ENCONTRAR "ANCLAS" (Filas basadas en Cantidad)
+    anchors = [] # Lista de tuplas (y_position, quantity_value)
     
-    items = []
-    
-    # Variables temporales para construir el item actual
-    current_item = {
-        "qty": "", "desc": "", "upc": "", "unit": "", "total": "", "top_y": 0
-    }
-    
-    # Rango vertical de seguridad (para no leer encabezados ni pies de página)
-    # Solo leemos items que estén en el "cuerpo" de la factura
-    start_reading = False
-    
-    # Agrupamos palabras por líneas visuales (Y-axis) con un margen de error de 10px
-    lines = {} 
+    start_scanning = False
+    stop_scanning = False
     
     for i in range(n_boxes):
         text = d['text'][i].strip()
-        if not text: continue
-        
-        # Coordenadas
-        x = d['left'][i]
         y = d['top'][i]
-        w = d['width'][i]
-        h = d['height'][i]
+        x = d['left'][i]
         
-        # --- DETECTOR DE INICIO/FIN ---
-        # Empezamos a leer items cuando pasamos los encabezados de la tabla
-        if "QUANTITY" in text or "CANTIDAD" in text or "DESCRIPTION" in text:
-            start_reading = True
-            continue # Saltamos la palabra del encabezado
-            
-        # Dejamos de leer si llegamos a los totales o firmas
-        if "SUBTOTAL" in text or "TOTAL" in text or "FIRMA" in text or "DUE DATE" in text:
-            if y > img_height * 0.4: # Solo si está en la mitad inferior
-                start_reading = False
+        # Detectores de área segura
+        if "QUANTITY" in text or "DESCRIPTION" in text: start_scanning = True
+        if "SUBTOTAL" in text or "TOTAL" in text: 
+             if y > height * 0.4: stop_scanning = True # Solo si está abajo
         
-        if not start_reading: continue
+        if not start_scanning or stop_scanning: continue
         
-        # --- LÓGICA DE ASIGNACIÓN A COLUMNAS ---
-        
-        # 1. Detectar si es el INICIO de un nuevo item (La columna Cantidad es la clave)
-        # Si el texto está a la izquierda (x < LIM_QTY) y es un número entero
-        if x < LIM_QTY and re.match(r'^\d+$', text):
-            # Si ya teníamos un item construyéndose, lo guardamos
-            if current_item["qty"]:
-                items.append(current_item)
-            
-            # Empezamos uno nuevo
-            current_item = {
-                "qty": text, 
-                "desc": "", 
-                "upc": "", 
-                "unit": "", 
-                "total": "",
-                "top_y": y # Guardamos la altura para referencia
-            }
-            continue # Ya procesamos esta palabra
-            
-        # 2. Si no es cantidad, agregamos al item actual (si existe)
-        if current_item["qty"]:
-            # Verificamos que no esté demasiado lejos verticalmente (ej. más de 100px abajo es otro bloque)
-            if y > current_item["top_y"] + 150: 
-                continue 
+        # SI ES UNA CANTIDAD (Número a la izquierda)
+        if x < X_QTY_LIMIT and re.match(r'^\d+$', text):
+            # Guardamos la posición Y y el valor
+            anchors.append({'y': y, 'qty': text, 'index': i})
 
-            # Asignar a columna según posición X
-            if LIM_QTY < x < LIM_DESC:
-                current_item["desc"] += " " + text
-            elif LIM_DESC < x < LIM_UPC:
-                # Aquí suele estar CHN y el UPC. Filtramos basura.
-                if len(text) > 3 or text == "CHN": 
-                    current_item["upc"] += " " + text
-            elif LIM_UPC < x < LIM_PRICE:
-                # Precio unitario (ignoramos el símbolo $)
-                if "$" not in text:
-                    current_item["unit"] += text
-            elif x > LIM_PRICE:
-                # Total (ignoramos el símbolo $)
-                if "$" not in text:
-                    current_item["total"] += text
+    # Si no hay items, salir
+    if not anchors: return []
 
-    # Agregar el último item pendiente
-    if current_item["qty"]:
-        items.append(current_item)
+    # 3. EXTRAER DATOS POR BLOQUES
+    # Definimos el "Piso" de cada fila como la Y del siguiente item
+    items = []
+    
+    for idx, anchor in enumerate(anchors):
+        # El techo es la Y del anchor actual (menos un margen por si el texto 'Modelo' está un pelín arriba)
+        y_top = anchor['y'] - 10 
         
-    # Limpieza final de espacios
-    for item in items:
-        for k in item:
-            if isinstance(item[k], str):
-                item[k] = item[k].strip()
+        # El piso es la Y del siguiente anchor, o el final de la tabla si es el último
+        if idx + 1 < len(anchors):
+            y_bottom = anchors[idx+1]['y'] - 5
+        else:
+            y_bottom = height * 0.80 # Hasta abajo (antes del footer)
+            
+        # Variables para concatenar texto de este bloque
+        desc_parts = [] # Lista de tuplas (y, x, text) para ordenar lectura
+        unit_price = ""
+        total_price = ""
+        upc = ""
+        
+        # Barrer TODAS las palabras de la página para ver cuáles caen en este bloque Y
+        for i in range(n_boxes):
+            word = d['text'][i].strip()
+            if not word: continue
+            
+            wy = d['top'][i]
+            wx = d['left'][i]
+            
+            # Chequeamos si la palabra cae dentro de la franja vertical de este item
+            if y_top <= wy < y_bottom:
                 
-    return items
+                # Clasificar por Columna X
+                
+                # COLUMNA DESCRIPCIÓN (captura Modelo + Descripcion)
+                if X_DESC_START < wx < X_DESC_END:
+                    desc_parts.append((wy, wx, word))
+                    
+                # COLUMNA UPC / PAIS
+                elif X_DESC_END < wx < X_PRICE_START:
+                    if len(word) > 3 or word == "CHN": # Filtro básico
+                        upc += " " + word
+                        
+                # COLUMNA PRECIO UNITARIO
+                elif X_PRICE_START < wx < (width * 0.88):
+                    if re.match(r'[\d,]+\.\d{2}', word): # Solo si parece dinero
+                        unit_price = word
+                        
+                # COLUMNA TOTAL
+                elif wx > (width * 0.88):
+                    if re.match(r'[\d,]+\.\d{2}', word):
+                        total_price = word
 
-def extract_header_data(full_text):
-    """Extrae datos generales (Factura, Fecha) usando Regex simple"""
-    data = {}
-    # Factura
-    inv = re.search(r'(?:#|No\.)\s*(\d{6})', full_text)
-    data['Factura'] = inv.group(1) if inv else "No encontrada"
-    
-    # Fecha
-    date = re.search(r'DATE/FECHA\s*[:.,]?\s*([A-Za-z]{3}\s\d{2},\s\d{4})', full_text)
-    data['Fecha'] = date.group(1) if date else ""
-    
-    # Orden
-    orden = re.search(r'ORDER/ORDEN\s*#\s*[:.,]?\s*(\d+)', full_text)
-    data['Orden'] = orden.group(1) if orden else ""
-    
-    return data
+        # 4. ORDENAR Y LIMPIAR DESCRIPCIÓN
+        # Ordenamos primero por altura (Y) y luego por izquierda (X) para leer en orden natural
+        desc_parts.sort(key=lambda k: (k[0], k[1]))
+        full_desc = " ".join([p[2] for p in desc_parts])
+        
+        items.append({
+            "Cantidad": anchor['qty'],
+            "Descripción": full_desc.strip(),
+            "UPC/Ref": upc.strip(),
+            "Precio Unit.": unit_price,
+            "Total": total_price
+        })
+        
+    return items
 
 # ==========================================
 # 🖥️ INTERFAZ PRINCIPAL
@@ -168,70 +185,69 @@ def extract_header_data(full_text):
 uploaded_file = st.file_uploader("Sube la Factura Regal (PDF)", type=["pdf"])
 
 if uploaded_file is not None:
-    if st.button("🚀 Extraer Datos"):
+    if st.button("🚀 Extraer Datos (Modo Avanzado)"):
         
-        with st.status("Analizando estructura visual...", expanded=True) as status:
+        with st.status("Procesando con IA...", expanded=True) as status:
             try:
-                # 1. Convertir a imagen
                 images = convert_from_bytes(uploaded_file.read())
                 
-                # 2. Procesar primera página (usualmente ahí están los items)
-                # Obtenemos texto crudo para cabecera y datos visuales para items
-                full_text = pytesseract.image_to_string(images[0], lang='spa')
+                # 1. Encabezado (Texto Completo)
+                full_text = pytesseract.image_to_string(images[0], lang='spa', config='--psm 4')
+                header_data = extract_header_data_improved(full_text)
                 
-                # A. Datos Generales
-                st.write("Leeyendo cabecera...")
-                header_data = extract_header_data(full_text)
+                # 2. Items (Análisis Espacial)
+                items_data = extract_items_advanced(images[0])
                 
-                # B. Items por Coordenadas
-                st.write("Escaneando columnas invisibles...")
-                items_data = extract_items_by_coordinates(images[0])
+                status.update(label="¡Extracción Finalizada!", state="complete")
                 
-                status.update(label="¡Completado!", state="complete")
+                # --- MOSTRAR RESULTADOS ---
+                st.subheader(f"Factura: {header_data.get('Factura', 'ND')}")
                 
-                # --- VISUALIZACIÓN ---
-                st.subheader(f"Factura #{header_data['Factura']}")
-                
-                # Mostrar Cabecera
-                col1, col2, col3 = st.columns(3)
-                col1.metric("Fecha", header_data['Fecha'])
-                col2.metric("Orden Compra", header_data['Orden'])
-                col3.metric("Items Detectados", len(items_data))
-                
+                # Métricas
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Fecha", header_data.get('Fecha Emisión', ''))
+                c2.metric("Orden #", header_data.get('Orden Compra', ''))
+                c3.metric("Ref", header_data.get('Referencia', ''))
+                c4.metric("Incoterm", header_data.get('Incoterm', ''))
+
+                # Direcciones
+                with st.expander("📍 Ver Direcciones", expanded=False):
+                    col_a, col_b = st.columns(2)
+                    col_a.info(f"**Vendido A:**\n\n{header_data.get('Vendido A', '')}")
+                    col_b.info(f"**Embarcado A:**\n\n{header_data.get('Embarcado A', '')}")
+
                 st.divider()
+                st.subheader("📦 Productos (Descripción Completa)")
                 
-                # Mostrar Tabla
                 if items_data:
                     df = pd.DataFrame(items_data)
-                    # Renombrar columnas para que se vea bonito
-                    df.columns = ["Cantidad", "Descripción / Modelo", "UPC / Origen", "Precio Unit.", "Total Línea", "Y-Pos"]
-                    # Quitar columna técnica Y-Pos
-                    df = df.drop(columns=["Y-Pos"])
-                    
                     st.dataframe(df, use_container_width=True)
                     
-                    # --- EXPORTAR EXCEL ---
+                    # --- GENERAR EXCEL ---
                     buffer = io.BytesIO()
                     with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-                        # Hoja 1: Resumen
-                        pd.DataFrame([header_data]).to_excel(writer, sheet_name="General", index=False)
-                        # Hoja 2: Detalle
+                        # Hoja 1
+                        df_head = pd.DataFrame(list(header_data.items()), columns=["Campo", "Valor"])
+                        df_head.to_excel(writer, sheet_name="Datos Generales", index=False)
+                        
+                        # Hoja 2
                         df.to_excel(writer, sheet_name="Items", index=False)
                         
-                        # Formato bonito
+                        # Formato
                         workbook = writer.book
-                        worksheet = writer.sheets['Items']
-                        worksheet.set_column('B:B', 50) # Columna descripción ancha
-                    
+                        ws = writer.sheets['Items']
+                        ws.set_column('B:B', 60) # Ancho columna descripción
+                        format_wrap = workbook.add_format({'text_wrap': True})
+                        ws.set_column('B:B', 60, format_wrap)
+                        
                     st.download_button(
                         "📥 Descargar Excel",
                         data=buffer.getvalue(),
-                        file_name=f"Regal_{header_data['Factura']}.xlsx",
+                        file_name=f"Regal_{header_data.get('Factura', 'export')}.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                     )
                 else:
-                    st.warning("No se pudieron detectar items. Verifica que la imagen sea clara.")
-                    st.text(full_text) # Debug
+                    st.warning("No se encontraron items. Intenta escanear con mayor calidad.")
                     
             except Exception as e:
                 st.error(f"Error técnico: {e}")
