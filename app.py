@@ -6,142 +6,173 @@ import pandas as pd
 import io
 import shutil
 import re
+from PIL import Image, ImageDraw
 
 # --- CONFIGURACIÓN ---
-st.set_page_config(page_title="Extractor Regal Trading", layout="wide")
-st.title("📄 Extractor Regal Trading (Corregido)")
+st.set_page_config(page_title="Regal OCR - Por Coordenadas", layout="wide")
+st.title("🎯 Extractor Regal Trading - Por Zonas Exactas")
 
 if not shutil.which("tesseract"):
     st.error("❌ Error: Tesseract no está instalado.")
     st.stop()
 
-# ==========================================
-# 🛠️ UTILIDADES
-# ==========================================
-def clean_text(text):
-    return " ".join(text.split())
+# ==============================================================================
+# 📍 MAPA DE COORDENADAS (AJUSTA ESTOS NÚMEROS SEGÚN TU IMAGEN)
+# ==============================================================================
+# Formato: (Izquierda%, Arriba%, Derecha%, Abajo%)
+# Ejemplo: (0.0, 0.0, 0.5, 0.1) es la mitad izquierda superior.
+
+ZONES = {
+    # --- ENCABEZADO DERECHO ---
+    "Factura":    (0.70, 0.05, 0.95, 0.15),  # Donde está el # 297107
+    "Fecha":      (0.70, 0.18, 0.95, 0.23),  # Donde dice AUG 07
+    "Orden":      (0.70, 0.25, 0.95, 0.29),  # Donde dice ORDER 173900
+    "Ref":        (0.70, 0.20, 0.95, 0.24),  # Donde dice REF
+    
+    # --- DIRECCIONES (Cajas del medio) ---
+    "Vendido A":  (0.01, 0.20, 0.49, 0.38),  # Caja Izquierda
+    "Embarcado A":(0.51, 0.20, 0.99, 0.38)   # Caja Derecha
+}
+
+# --- COLUMNAS DE LA TABLA (Solo posición X) ---
+TABLE_COLS = {
+    "QTY_END": 0.13,      # Fin de la columna Cantidad
+    "DESC_START": 0.13,   # Inicio Descripción
+    "DESC_END": 0.58,     # Fin Descripción / Inicio UPC
+    "UPC_END": 0.73,      # Fin UPC / Inicio Precio
+    "PRICE_END": 0.88     # Fin Precio / Inicio Total
+}
 
 # ==========================================
-# 🧠 LÓGICA DE ITEMS (CORREGIDA)
+# 🛠️ MOTORES DE EXTRACCIÓN
 # ==========================================
 
-def extract_items_fixed(image):
-    # 1. Obtener datos
+def crop_and_extract(image, coords, config='--psm 6'):
+    """Recorta un rectángulo y lee el texto dentro."""
+    w, h = image.size
+    left = w * coords[0]
+    top = h * coords[1]
+    right = w * coords[2]
+    bottom = h * coords[3]
+    
+    cropped = image.crop((left, top, right, bottom))
+    text = pytesseract.image_to_string(cropped, lang='spa', config=config)
+    return text.strip().replace('\n', ' ')
+
+def extract_header_zones(image):
+    """Extrae datos fijos basados en las ZONES configuradas arriba."""
+    data = {}
+    
+    # Extraer texto crudo de cada zona
+    raw_inv = crop_and_extract(image, ZONES["Factura"])
+    raw_date = crop_and_extract(image, ZONES["Fecha"])
+    raw_ord = crop_and_extract(image, ZONES["Orden"])
+    raw_ref = crop_and_extract(image, ZONES["Ref"])
+    
+    # Limpieza con Regex (Por si se cuela la etiqueta "DATE:")
+    # Factura
+    m_inv = re.search(r'(\d{6})', raw_inv)
+    data['Factura'] = m_inv.group(1) if m_inv else raw_inv
+    
+    # Fecha
+    m_date = re.search(r'([A-Za-z]{3}\s+\d{1,2}[,.]?\s+\d{4})', raw_date)
+    data['Fecha'] = m_date.group(1) if m_date else raw_date.replace("DATE/FECHA", "").strip()
+    
+    # Orden
+    m_ord = re.search(r'(\d{4,})', raw_ord)
+    data['Orden'] = m_ord.group(1) if m_ord else raw_ord.replace("ORDER/ORDEN", "").strip()
+
+    # Ref
+    data['Ref'] = raw_ref.replace("FILE/REF", "").replace(":", "").strip()
+
+    # Direcciones (Texto completo del bloque)
+    data['Vendido A'] = crop_and_extract(image, ZONES["Vendido A"])
+    data['Embarcado A'] = crop_and_extract(image, ZONES["Embarcado A"])
+    
+    return data
+
+def extract_table_rows(image):
+    """Detecta filas basándose en la columna Cantidad y corta horizontalmente."""
     d = pytesseract.image_to_data(image, output_type=Output.DICT, lang='spa', config='--psm 6')
     n_boxes = len(d['text'])
     w, h = image.size
     
-    # --- CONFIGURACIÓN DE ZONAS (AQUÍ ESTABA EL ERROR) ---
-    
-    # 1. Dónde buscar el NÚMERO DE CANTIDAD (Anchor)
-    # Lo pongo en 0.14 (14%) para asegurar que detecte el número "234" o "207"
-    X_QTY_SEARCH_LIMIT = w * 0.15 
-    
-    # 2. Dónde empieza la DESCRIPCIÓN
-    # Lo pongo en 0.10 (10%) para que empiece a leer MUY a la izquierda (captura "TCL")
-    X_DESC_START = w * 0.10 
-    X_DESC_END = w * 0.58
-    
-    X_UPC_START = w * 0.60
-    X_PRICE_START = w * 0.74
-    
-    # 2. ENCONTRAR FILAS (ANCLAS)
+    # 1. ENCONTRAR FILAS (Buscando números en la zona de Cantidad)
     anchors = []
-    
-    start_y = h * 0.30
-    end_y = h * 0.85
+    limit_qty_px = w * TABLE_COLS["QTY_END"]
     
     for i in range(n_boxes):
         text = d['text'][i].strip()
         cx = d['left'][i]
         cy = d['top'][i]
         
-        if cy < start_y or cy > end_y: continue
+        # Filtro de zona vertical (cuerpo de factura)
+        if cy < h * 0.35 or cy > h * 0.85: continue
         
-        # BUSCAMOS EL NÚMERO USANDO EL LÍMITE SEGURO (15%)
-        if cx < X_QTY_SEARCH_LIMIT and re.match(r'^\d+$', text):
-             # Filtro: Ignorar números sueltos muy pequeños o basura
-             # Normalmente la cantidad tiene altura similar a otras letras
-             anchors.append({'y': cy, 'qty': text})
-
+        # Si está a la izquierda y es número
+        if cx < limit_qty_px and re.match(r'^\d+$', text):
+            anchors.append({'y': cy, 'qty': text})
+            
     if not anchors: return []
 
-    # 3. EXTRAER DATOS
+    # 2. PROCESAR CADA FILA
     items = []
     
+    # Límites horizontales en pixeles
+    x_desc_start = w * TABLE_COLS["DESC_START"]
+    x_desc_end = w * TABLE_COLS["DESC_END"]
+    x_upc_end = w * TABLE_COLS["UPC_END"]
+    x_price_end = w * TABLE_COLS["PRICE_END"]
+    
     for idx, anchor in enumerate(anchors):
-        # Miramos 35 píxeles ARRIBA para capturar texto superior
-        y_top = anchor['y'] - 35 
+        # Definir altura de la fila
+        # Miramos 25px arriba para capturar negritas, y hasta la siguiente fila abajo
+        y_start = anchor['y'] - 25
         
         if idx + 1 < len(anchors):
-            y_bottom = anchors[idx+1]['y'] - 10
+            y_end = anchors[idx+1]['y'] - 5
         else:
-            y_bottom = anchor['y'] + 200
+            y_end = anchor['y'] + 150 # Última fila
             
-        desc_words = []
-        upc_words = []
-        unit_words = []
-        total_words = []
+        # Recortamos la franja horizontal completa de esta fila
+        # (left, top, right, bottom)
+        row_img = image.crop((0, y_start, w, y_end))
         
-        for i in range(n_boxes):
-            word = d['text'][i].strip()
+        # Ahora leemos TODA la fila y clasificamos palabras por su posición X relativa
+        row_data = pytesseract.image_to_data(row_img, output_type=Output.DICT, lang='spa', config='--psm 6')
+        n_row = len(row_data['text'])
+        
+        desc_parts = []
+        upc_parts = []
+        unit_parts = []
+        total_parts = []
+        
+        for i in range(n_row):
+            word = row_data['text'][i].strip()
             if not word: continue
-            wx, wy = d['left'][i], d['top'][i]
             
-            if y_top <= wy < y_bottom:
+            # Coordenada X dentro de la fila
+            wx = row_data['left'][i]
+            
+            # Clasificar
+            if x_desc_start < wx < x_desc_end:
+                desc_parts.append(word)
+            elif x_desc_end < wx < x_upc_end:
+                if len(word) > 2: upc_parts.append(word)
+            elif x_upc_end < wx < x_price_end:
+                if re.match(r'[\d,]+\.\d{2}', word): unit_parts.append(word)
+            elif wx > x_price_end:
+                if re.match(r'[\d,]+\.\d{2}', word): total_parts.append(word)
                 
-                # Descripción: Usamos el inicio EXPANDIDO (10%)
-                if X_DESC_START < wx < X_DESC_END:
-                    desc_words.append((wy, wx, word))
-                    
-                elif X_UPC_START < wx < X_PRICE_START:
-                    if len(word) > 2: upc_words.append(word)
-                    
-                elif X_PRICE_START < wx < (w * 0.88):
-                    if re.match(r'[\d,]+\.\d{2}', word): unit_words.append(word)
-                    
-                elif wx > (w * 0.88):
-                    if re.match(r'[\d,]+\.\d{2}', word): total_words.append(word)
-
-        desc_words.sort(key=lambda k: (k[0], k[1]))
-        full_desc = " ".join([w[2] for w in desc_words])
-        
         items.append({
             "Cantidad": anchor['qty'],
-            "Descripción": full_desc,
-            "UPC": " ".join(upc_words),
-            "Precio": unit_words[0] if unit_words else "",
-            "Total": total_words[0] if total_words else ""
+            "Descripción": " ".join(desc_parts),
+            "UPC": " ".join(upc_parts),
+            "Precio": unit_parts[0] if unit_parts else "",
+            "Total": total_parts[0] if total_parts else ""
         })
         
     return items
-
-# ==========================================
-# 🧠 LÓGICA DE ENCABEZADO
-# ==========================================
-def extract_header_robust(full_text):
-    data = {}
-    
-    inv = re.search(r'(?:#|No\.|297107)\s*(\d{6})', full_text)
-    if not inv: inv = re.search(r'#\s*(\d{6})', full_text)
-    data['Factura'] = inv.group(1) if inv else ""
-
-    date = re.search(r'(?:DATE|FECHA)\s*[:.,]?\s*([A-Za-z]{3}\s+\d{1,2}[,.]?\s+\d{4})', full_text, re.IGNORECASE)
-    data['Fecha'] = date.group(1) if date else ""
-
-    orden = re.search(r'(?:ORDER|ORDEN)\s*#?\s*[:.,]?\s*(\d+)', full_text, re.IGNORECASE)
-    data['Orden'] = orden.group(1) if orden else ""
-
-    ref = re.search(r'(?:FILE|REF)\s*[:.,]?\s*([A-Z0-9]+)', full_text, re.IGNORECASE)
-    data['Ref'] = ref.group(1) if ref else ""
-
-    sold = re.search(r'SOLD TO/VENDIDO A:(.*?)(?=SHIP TO|124829|\d{2}/\d{2})', full_text, re.DOTALL)
-    data['Vendido A'] = clean_text(sold.group(1)) if sold else ""
-
-    ship = re.search(r'SHIP TO/EMBARCADO A:(.*?)(?=PAYMENT|DUE DATE|PAGE)', full_text, re.DOTALL)
-    data['Embarcado A'] = clean_text(ship.group(1)) if ship else ""
-    
-    return data
 
 # ==========================================
 # 🖥️ INTERFAZ PRINCIPAL
@@ -150,44 +181,70 @@ def extract_header_robust(full_text):
 uploaded_file = st.file_uploader("Sube Factura (PDF)", type=["pdf"])
 
 if uploaded_file is not None:
-    if st.button("🚀 PROCESAR"):
+    # Cargar imagen en alta calidad
+    images = convert_from_bytes(uploaded_file.read(), dpi=250)
+    target_img = images[0]
+    w, h = target_img.size
+    
+    # --- PESTAÑAS ---
+    tab_run, tab_debug = st.tabs(["🚀 Extracción", "👁️ Verificación Visual"])
+    
+    with tab_debug:
+        st.write("Verifica que las cajas (Rojo) y líneas (Azul) coincidan con tus datos.")
         
-        with st.status("Analizando...", expanded=True) as status:
-            try:
-                # 1. Convertir
-                images = convert_from_bytes(uploaded_file.read(), dpi=250)
-                target_img = images[0]
-                
-                # 2. Header
-                full_text = pytesseract.image_to_string(target_img, lang='spa')
-                header = extract_header_robust(full_text)
-                
-                # 3. Items
-                items = extract_items_fixed(target_img)
-                
-                status.update(label="¡Listo!", state="complete")
-                
-                # --- RESULTADOS ---
-                c1, c2, c3 = st.columns(3)
-                c1.success(f"Factura: {header.get('Factura')}")
-                c2.info(f"Orden: {header.get('Orden')}")
-                
-                if items:
-                    c3.success(f"Items Detectados: {len(items)}")
-                    df = pd.DataFrame(items)
-                    st.dataframe(df, use_container_width=True)
+        # Dibujar sobre la imagen
+        debug_img = target_img.copy()
+        draw = ImageDraw.Draw(debug_img)
+        
+        # 1. Dibujar Zonas de Encabezado (Cajas Rojas)
+        for name, coords in ZONES.items():
+            left, top, right, bottom = w*coords[0], h*coords[1], w*coords[2], h*coords[3]
+            draw.rectangle([left, top, right, bottom], outline="red", width=3)
+            draw.text((left, top), name, fill="red")
+            
+        # 2. Dibujar Columnas de Tabla (Líneas Azules)
+        for col_name, pct in TABLE_COLS.items():
+            x = w * pct
+            draw.line([(x, h*0.35), (x, h*0.85)], fill="blue", width=3)
+            
+        st.image(debug_img, use_column_width=True)
+        st.caption("Si las cajas rojas no cubren el texto, edita el diccionario 'ZONES' en el código (Líneas 24-34).")
+
+    with tab_run:
+        if st.button("Extraer Datos"):
+            with st.spinner("Recortando y leyendo zonas..."):
+                try:
+                    # 1. Header
+                    header = extract_header_zones(target_img)
                     
-                    # Excel
-                    buffer = io.BytesIO()
-                    with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-                        pd.DataFrame([header]).to_excel(writer, sheet_name="General", index=False)
-                        df.to_excel(writer, sheet_name="Items", index=False)
-                        writer.sheets['Items'].set_column('B:B', 70)
+                    # 2. Items
+                    items = extract_table_rows(target_img)
+                    
+                    # Resultados
+                    c1, c2, c3 = st.columns(3)
+                    c1.success(f"Factura: {header['Factura']}")
+                    c2.info(f"Orden: {header['Orden']}")
+                    c3.warning(f"Items: {len(items)}")
+                    
+                    st.write("**Direcciones:**")
+                    d1, d2 = st.columns(2)
+                    d1.text_area("Vendido A", header['Vendido A'], height=100)
+                    d2.text_area("Embarcado A", header['Embarcado A'], height=100)
+                    
+                    if items:
+                        df = pd.DataFrame(items)
+                        st.dataframe(df, use_container_width=True)
                         
-                    st.download_button("📥 Descargar Excel", buffer.getvalue(), "factura_regal.xlsx")
-                else:
-                    st.error("⚠️ No se encontraron items.")
-                    st.write("Debug: El sistema buscó cantidades en el primer 15% del ancho de la página.")
-                    
-            except Exception as e:
-                st.error(f"Error técnico: {e}")
+                        # Excel
+                        buffer = io.BytesIO()
+                        with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+                            pd.DataFrame([header]).to_excel(writer, sheet_name="General", index=False)
+                            df.to_excel(writer, sheet_name="Items", index=False)
+                            writer.sheets['Items'].set_column('B:B', 60)
+                        
+                        st.download_button("📥 Excel Final", buffer.getvalue(), "regal_zones.xlsx")
+                    else:
+                        st.error("No se detectaron items. Revisa la pestaña 'Verificación Visual'.")
+                        
+                except Exception as e:
+                    st.error(f"Error: {e}")
