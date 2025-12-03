@@ -9,7 +9,7 @@ import re
 
 # --- CONFIGURACIÓN ---
 st.set_page_config(page_title="Extractor Regal Trading", layout="wide")
-st.title("📄 Extractor Regal Trading (Con Filtro de Duplicados)")
+st.title("📄 Extractor Especializado: Regal Trading (Multi-Formato)")
 
 # --- VERIFICACIÓN DE SISTEMA ---
 if not shutil.which("tesseract"):
@@ -17,263 +17,207 @@ if not shutil.which("tesseract"):
     st.stop()
 
 # ==========================================
-# 🛠️ UTILIDADES
+# 🧠 LÓGICA DE EXTRACCIÓN (AJUSTADA PARA ACCESORIOS)
 # ==========================================
-def clean_text_block(text):
-    """Limpia bloques de texto eliminando saltos de línea innecesarios."""
-    if not text: return ""
-    return " ".join(text.split())
 
-# ==========================================
-# 🧠 LÓGICA DE ITEMS (V7 - CLUSTERING VERTICAL)
-# ==========================================
-def extract_items_clustering(image):
+def clean_decimal(text):
+    """Limpia símbolos de moneda y espacios"""
+    if not text: return "0.00"
+    clean = re.sub(r'[^\d.]', '', text)
+    return clean if clean else "0.00"
+
+def extract_items_by_coordinates(image):
     """
-    Esta es la lógica que te funcionó bien para separar items sin revolverlos.
+    Lógica mejorada: Detecta cantidades desplazadas y descripciones largas
+    que invaden la columna UPC.
     """
+    # 1. Obtener datos (Usamos psm 6 para bloques de texto)
     d = pytesseract.image_to_data(image, output_type=Output.DICT, lang='spa', config='--psm 6')
     n_boxes = len(d['text'])
-    w, h = image.size
+    img_width, img_height = image.size
     
-    # --- ZONAS DE COLUMNAS ---
-    X_QTY_LIMIT = w * 0.12     
-    X_DESC_START = w * 0.12    
-    X_DESC_END = w * 0.58
-    X_UPC_START = w * 0.58     
-    X_UPC_END = w * 0.72
-    X_PRICE_START = w * 0.72   
-    X_PRICE_END = w * 0.88
+    # --- AJUSTE DE LÍMITES (CRUCIAL PARA PDF 5284) ---
+    # Aumentamos el límite de cantidad al 14% (antes 12%) para atrapar números movidos
+    LIM_QTY = img_width * 0.14
     
-    # PASO 1: ENCONTRAR ANCLAS (CANTIDADES)
-    anchors = []
-    min_y = h * 0.25 
-    max_y = h * 0.85
+    # La descripción empieza antes (12%)
+    LIM_DESC = img_width * 0.55
+    LIM_UPC = img_width * 0.72
+    LIM_PRICE = img_width * 0.88
+    
+    items = []
+    
+    current_item = {
+        "qty": "", "desc": "", "upc": "", "unit": "", "total": "", "top_y": 0
+    }
+    
+    start_reading = False
     
     for i in range(n_boxes):
         text = d['text'][i].strip()
-        cx = d['left'][i]
-        cy = d['top'][i]
+        if not text: continue
         
-        if cy < min_y or cy > max_y: continue
+        x = d['left'][i]
+        y = d['top'][i]
         
-        # Busca números en la columna izquierda
-        if cx < X_QTY_LIMIT and re.match(r'^[\d,.]+$', text):
-            if len(text) >= 1: 
-                anchors.append({'y': cy, 'qty': text})
-
-    if not anchors: return []
-
-    # Ordenar y filtrar duplicados cercanos
-    anchors.sort(key=lambda k: k['y'])
-    unique_anchors = []
-    if anchors:
-        unique_anchors.append(anchors[0])
-        for anc in anchors[1:]:
-            if anc['y'] - unique_anchors[-1]['y'] > 15:
-                unique_anchors.append(anc)
-    anchors = unique_anchors
-
-    # PASO 2: CLASIFICAR TEXTO POR FILAS
-    items = []
-    
-    for idx, anchor in enumerate(anchors):
-        row_top = anchor['y'] - 20 
-        
-        if idx + 1 < len(anchors):
-            row_bottom = anchors[idx+1]['y'] - 5
-        else:
-            row_bottom = anchor['y'] + 150 
+        # --- DETECTOR DE INICIO/FIN ---
+        if "QUANTITY" in text or "CANTIDAD" in text or "DESCRIPTION" in text:
+            start_reading = True
+            continue 
             
-        desc_tokens = []
-        upc_tokens = []
-        unit_tokens = []
-        total_tokens = []
+        # Fin de tabla (Totales, Firmas, Notas)
+        if "SUBTOTAL" in text or "TOTAL" in text or "FIRMA" in text or "DUE DATE" in text:
+            if y > img_height * 0.4: 
+                start_reading = False
         
-        for i in range(n_boxes):
-            text = d['text'][i].strip()
-            if not text: continue
+        if not start_reading: continue
+        
+        # --- LÓGICA DE ASIGNACIÓN INTELIGENTE ---
+        
+        # 1. DETECTAR NUEVO ITEM (Cantidad)
+        # Usamos LIM_QTY expandido (14%) y regex estricto de números
+        if x < LIM_QTY and re.match(r'^\d+$', text):
+            # Guardar anterior
+            if current_item["qty"]:
+                items.append(current_item)
             
-            bx = d['left'][i]
-            by = d['top'][i]
+            # Nuevo item
+            current_item = {
+                "qty": text, "desc": "", "upc": "", "unit": "", "total": "", "top_y": y
+            }
+            continue 
             
-            if row_top <= by < row_bottom:
-                if X_DESC_START < bx < X_DESC_END:
-                    desc_tokens.append((by, bx, text))
-                elif X_DESC_END < bx < X_UPC_END:
-                    if len(text) > 3 and text != "CHN": upc_tokens.append(text)
-                elif X_UPC_END < bx < X_PRICE_END:
-                    if re.match(r'[\d,.]+', text): unit_tokens.append(text)
-                elif bx > X_PRICE_END:
-                    if re.match(r'[\d,.]+', text): total_tokens.append(text)
+        # 2. AGREGAR DATOS AL ITEM ACTUAL
+        if current_item["qty"]:
+            # Filtro vertical: Si el texto está muy lejos (>150px) abajo, lo ignoramos
+            # Esto evita mezclar basura del pie de página
+            if y > current_item["top_y"] + 150: 
+                continue 
 
-        desc_tokens.sort(key=lambda k: (k[0], k[1]))
-        full_desc = " ".join([t[2] for t in desc_tokens])
+            # -- COLUMNA DESCRIPCIÓN --
+            if LIM_QTY < x < LIM_DESC:
+                current_item["desc"] += " " + text
+                
+            # -- COLUMNA UPC (CON LÓGICA DE DESBORDAMIENTO) --
+            elif LIM_DESC < x < LIM_UPC:
+                # AQUÍ ESTÁ EL TRUCO PARA EL PDF 5284:
+                # Si el texto en la columna UPC parece un código técnico (tiene letras, barras, guiones)
+                # y NO es "CHN" ni solo números, entonces es parte de la DESCRIPCIÓN larga.
+                
+                is_pure_upc = re.match(r'^\d+$', text) or text == "CHN"
+                
+                if is_pure_upc:
+                    if len(text) > 3 or text == "CHN": # Filtro de ruido
+                        current_item["upc"] += " " + text
+                else:
+                    # Es parte de la descripción que se salió de su columna
+                    current_item["desc"] += " " + text
+                    
+            # -- COLUMNA PRECIO --
+            elif LIM_UPC < x < LIM_PRICE:
+                if "$" not in text:
+                    current_item["unit"] += text
+                    
+            # -- COLUMNA TOTAL --
+            elif x > LIM_PRICE:
+                if "$" not in text:
+                    current_item["total"] += text
+
+    # Guardar último item
+    if current_item["qty"]:
+        items.append(current_item)
         
-        # Precios: Tomar el último valor encontrado (suele ser el más limpio)
-        u_price = unit_tokens[-1] if unit_tokens else ""
-        t_price = total_tokens[-1] if total_tokens else ""
-        
-        items.append({
-            "Cantidad": anchor['qty'],
-            "Descripción": full_desc,
-            "UPC": " ".join(upc_tokens),
-            "Precio Unit.": u_price,
-            "Total": t_price
-        })
-        
+    # Limpieza final
+    for item in items:
+        for k in item:
+            if isinstance(item[k], str): item[k] = item[k].strip()
+                
     return items
 
-# ==========================================
-# 🧠 LÓGICA DE CABECERA (CON DOTALL)
-# ==========================================
 def extract_header_data(full_text):
+    """Extrae datos generales (Factura, Fecha) usando Regex simple"""
     data = {}
     
     # Factura
-    inv = re.search(r'(?:#|No\.|297107)\s*(\d{6})', full_text)
-    if not inv: inv = re.search(r'#\s*(\d{6})', full_text)
-    data['Factura'] = inv.group(1) if inv else ""
-
+    inv = re.search(r'(?:#|No\.)\s*(\d{6})', full_text)
+    if not inv: inv = re.search(r'(?:#|No\.)\s*(\d{4})', full_text) # Soporte para 4 digitos (5284)
+    data['Factura'] = inv.group(1) if inv else "No encontrada"
+    
     # Fecha
     date = re.search(r'(?:DATE|FECHA)\s*[:.,]?\s*([A-Za-z]{3}\s+\d{1,2}[,.]?\s+\d{4})', full_text, re.IGNORECASE)
     data['Fecha'] = date.group(1) if date else ""
-
+    
     # Orden
-    orden = re.search(r'(?:ORDER|ORDEN).*?[:#]\s*(\d+)', full_text, re.IGNORECASE)
+    orden = re.search(r'(?:ORDER|ORDEN)\s*#?\s*[:.,]?\s*(\d+)', full_text, re.IGNORECASE)
     data['Orden'] = orden.group(1) if orden else ""
-
-    # Ref
-    ref = re.search(r'(?:FILE|REF)\s*[:.,]?\s*([A-Z0-9-]+)', full_text, re.IGNORECASE)
-    data['Ref'] = ref.group(1) if ref else ""
-    
-    # B/L
-    bl = re.search(r'B/L#\s*[:.,]?\s*([A-Z0-9]+)', full_text, re.IGNORECASE)
-    data['BL'] = bl.group(1) if bl else ""
-    
-    # Incoterm
-    incoterm = re.search(r'INCOTERM\s*[:.,]?\s*([A-Z]+)', full_text, re.IGNORECASE)
-    data['Incoterm'] = incoterm.group(1) if incoterm else ""
-
-    # Direcciones
-    sold = re.search(r'SOLD TO/VENDIDO A:(.*?)(?=SHIP TO|124829|\d{2}/\d{2})', full_text, re.DOTALL | re.IGNORECASE)
-    data['Vendido A'] = clean_text_block(sold.group(1)) if sold else ""
-
-    ship = re.search(r'SHIP TO/EMBARCADO A:(.*?)(?=PAYMENT|DUE DATE|PAGE)', full_text, re.DOTALL | re.IGNORECASE)
-    data['Embarcado A'] = clean_text_block(ship.group(1)) if ship else ""
     
     return data
-
-# ==========================================
-# 🕵️‍♂️ DETECTOR DE DUPLICADOS
-# ==========================================
-def is_duplicate_page(image):
-    """
-    Verifica si la página tiene la marca 'Duplicado' en la cabecera.
-    Recorta solo el 35% superior para buscar rápido.
-    """
-    w, h = image.size
-    # Recortar cabecera (Parte superior)
-    header_crop = image.crop((0, 0, w, h * 0.35))
-    
-    # Leer texto
-    text = pytesseract.image_to_string(header_crop, lang='spa')
-    
-    # Buscar palabra clave
-    if re.search(r'Duplicado', text, re.IGNORECASE):
-        return True
-    return False
 
 # ==========================================
 # 🖥️ INTERFAZ PRINCIPAL
 # ==========================================
 
-uploaded_files = st.file_uploader("Sube tus Facturas Regal (PDF)", type=["pdf"], accept_multiple_files=True)
+uploaded_file = st.file_uploader("Sube la Factura Regal (PDF)", type=["pdf"])
 
-if uploaded_files:
-    if st.button("🚀 Extraer Datos (Omitiendo Duplicados)"):
+if uploaded_file is not None:
+    if st.button("🚀 Extraer Datos"):
         
-        all_data_export = []
-        progress_bar = st.progress(0)
-        
-        for idx, uploaded_file in enumerate(uploaded_files):
-            with st.expander(f"📄 Procesando: {uploaded_file.name}", expanded=True):
-                try:
-                    # 1. Convertir
-                    images = convert_from_bytes(uploaded_file.read(), dpi=300)
-                    
-                    file_items = []
-                    header = {}
-                    pages_processed = 0
-                    
-                    # 2. Iterar sobre cada página
-                    for i, img in enumerate(images):
-                        
-                        # --- VALIDACIÓN DE DUPLICADO ---
-                        if is_duplicate_page(img):
-                            st.warning(f"⚠️ Página {i+1} omitida (Detectado como 'Duplicado')")
-                            continue # Salta a la siguiente página del bucle
-                        
-                        # Si es válida, procesamos
-                        st.info(f"✅ Procesando Página {i+1} (Original)")
-                        
-                        # Extraemos texto completo solo si es la primera página válida (para sacar el header)
-                        if pages_processed == 0:
-                            full_text = pytesseract.image_to_string(img, lang='spa')
-                            header = extract_header_data(full_text)
-                        
-                        # Extraemos items
-                        page_items = extract_items_clustering(img)
-                        file_items.extend(page_items)
-                        
-                        pages_processed += 1
-                    
-                    # --- RESULTADOS DEL ARCHIVO ---
-                    if header:
-                        c1, c2, c3, c4 = st.columns(4)
-                        c1.success(f"Factura: {header.get('Factura', 'ND')}")
-                        c2.metric("Orden", header.get('Orden', 'ND'))
-                        c3.metric("Fecha", header.get('Fecha', 'ND'))
-                        c4.metric("Items Extraídos", len(file_items))
-                    
-                    if file_items:
-                        df = pd.DataFrame(file_items)
-                        st.dataframe(df, use_container_width=True)
-                        
-                        # Guardar para el consolidado
-                        for it in file_items:
-                            row = header.copy()
-                            row.update(it)
-                            row['Archivo Origen'] = uploaded_file.name
-                            all_data_export.append(row)
-                    else:
-                        if pages_processed > 0:
-                            st.warning("No se encontraron items en las páginas originales.")
-                        else:
-                            st.error("Todas las páginas eran duplicados o no se pudieron leer.")
-                        
-                except Exception as e:
-                    st.error(f"Error procesando {uploaded_file.name}: {e}")
-            
-            progress_bar.progress((idx + 1) / len(uploaded_files))
-
-        # --- EXCEL FINAL ---
-        if all_data_export:
-            df_final = pd.DataFrame(all_data_export)
-            
-            # Ordenar columnas
-            cols = ['Archivo Origen', 'Factura', 'Fecha', 'Orden', 'Ref', 'BL', 'Incoterm', 
-                    'Vendido A', 'Embarcado A', 
-                    'Cantidad', 'Descripción', 'UPC', 'Precio Unit.', 'Total']
-            
-            final_cols = [c for c in cols if c in df_final.columns]
-            df_final = df_final[final_cols]
-            
-            buffer = io.BytesIO()
-            with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-                df_final.to_excel(writer, sheet_name="Consolidado", index=False)
-                ws = writer.sheets['Consolidado']
-                ws.set_column('A:I', 15)
-                ws.set_column('K:K', 60) 
+        with st.status("Analizando estructura visual...", expanded=True) as status:
+            try:
+                # 1. Convertir a imagen (Alta calidad DPI 300 para leer textos pequeños)
+                images = convert_from_bytes(uploaded_file.read(), dpi=300)
                 
-            st.success("✅ ¡Todo Listo! Se han filtrado las páginas duplicadas.")
-            st.download_button("📥 Descargar Reporte Limpio", buffer.getvalue(), "Reporte_Regal_Sin_Duplicados.xlsx")
+                # 2. Header (Solo página 1)
+                full_text = pytesseract.image_to_string(images[0], lang='spa')
+                st.write("Leyendo encabezado...")
+                header_data = extract_header_data(full_text)
+                
+                # 3. Items (Todas las páginas)
+                st.write("Escaneando items (Modo Elástico)...")
+                all_items = []
+                for img in images:
+                    items = extract_items_by_coordinates(img)
+                    all_items.extend(items)
+                
+                status.update(label="¡Completado!", state="complete")
+                
+                # --- VISUALIZACIÓN ---
+                st.subheader(f"Factura #{header_data['Factura']}")
+                
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Fecha", header_data['Fecha'])
+                col2.metric("Orden", header_data['Orden'])
+                col3.metric("Total Items", len(all_items))
+                
+                st.divider()
+                
+                if all_items:
+                    df = pd.DataFrame(all_items)
+                    # Columnas amigables
+                    df.columns = ["Cantidad", "Descripción / Modelo", "UPC", "Precio Unit.", "Total Línea", "Y-Pos"]
+                    st.dataframe(df.drop(columns=["Y-Pos"]), use_container_width=True)
+                    
+                    # --- EXPORTAR EXCEL ---
+                    buffer = io.BytesIO()
+                    with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+                        pd.DataFrame([header_data]).to_excel(writer, sheet_name="General", index=False)
+                        df.drop(columns=["Y-Pos"]).to_excel(writer, sheet_name="Items", index=False)
+                        
+                        # Formato
+                        workbook = writer.book
+                        worksheet = writer.sheets['Items']
+                        worksheet.set_column('B:B', 60) # Columna descripción ancha
+                        format_wrap = workbook.add_format({'text_wrap': True})
+                        worksheet.set_column('B:B', 60, format_wrap)
+                    
+                    st.download_button(
+                        "📥 Descargar Excel",
+                        data=buffer.getvalue(),
+                        file_name=f"Regal_{header_data['Factura']}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+                else:
+                    st.warning("No se pudieron detectar items. Verifica la calidad del PDF.")
+                    
+            except Exception as e:
+                st.error(f"Error técnico: {e}")
