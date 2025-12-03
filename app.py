@@ -10,196 +10,160 @@ import time
 st.set_page_config(page_title="Extractor IA (Gemini)", layout="wide")
 st.title("🤖 Extractor de Facturas con IA (Gemini)")
 
-# --- BARRA LATERAL PARA API KEY ---
+# --- BARRA LATERAL ---
 with st.sidebar:
     st.header("🔑 Configuración")
     api_key = st.text_input("Ingresa tu Google API Key", type="password")
-    st.markdown("[Obtener API Key Gratis](https://aistudio.google.com/app/apikey)")
-    
-    st.info("Nota: Gemini 1.5 Flash es rápido y gratuito para este volumen de datos.")
+    st.markdown("[Obtener API Key Gratis Aquí](https://aistudio.google.com/app/apikey)")
+    st.info("Nota: Si te da error 404, actualiza tu requirements.txt")
 
 # ==========================================
 # 🧠 CEREBRO DE LA IA
 # ==========================================
 
 def analyze_image_with_gemini(image, api_key):
-    """
-    Envía la imagen a Google Gemini y pide un JSON estructurado.
-    """
-    genai.configure(api_key=api_key)
-    
-model = genai.GenerativeModel('gemini-pro')
-    
-    # El prompt maestro: Le damos instrucciones precisas de cómo queremos los datos
-    prompt = """
-    Actúa como un experto en extracción de datos de facturas (Data Entry).
-    Analiza esta imagen de una factura y extrae la información en formato JSON estricto.
-    
-    Reglas de Extracción:
-    1. CABECERA: Extrae Factura #, Fecha (Date), Orden (Order #), Referencia (File/Ref), B/L, Incoterm.
-    2. DIRECCIONES: Extrae el bloque completo de "Sold To" y "Ship To" limpiando saltos de línea.
-    3. DUPLICADOS: Revisa si en la parte superior derecha dice "Duplicado" o "Duplicate". Si dice, marca "is_duplicate": true.
-    4. ITEMS (La parte más importante):
-       - Extrae la tabla de productos fila por fila.
-       - Campos: Cantidad, Descripción (Une modelo y descripción), UPC, Precio Unitario, Total.
-       - CUIDADO: A veces la descripción es muy larga e invade la columna del UPC. Si el texto en UPC no parece un código (son letras o palabras), es parte de la descripción.
-       - Ignora números sueltos que no tengan precio asociado.
-    
-    Retorna SOLAMENTE este JSON (sin markdown ```json):
-    {
-        "is_duplicate": boolean,
-        "invoice_number": "string",
-        "date": "string",
-        "order": "string",
-        "ref": "string",
-        "bl": "string",
-        "incoterm": "string",
-        "sold_to": "string",
-        "ship_to": "string",
-        "items": [
-            {
-                "qty": "number",
-                "description": "string",
-                "upc": "string",
-                "unit_price": "number",
-                "total": "number"
-            }
-        ]
-    }
-    """
-    
+    """Envía la imagen a Google Gemini."""
     try:
-        # Enviamos la imagen y el prompt
+        genai.configure(api_key=api_key)
+        
+        # Intentamos usar el modelo Flash (más rápido)
+        # Si da error, asegúrate de tener google-generativeai>=0.7.0 en requirements.txt
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        
+        prompt = """
+        Eres un experto en extracción de datos contables (OCR Inteligente).
+        Analiza esta imagen de factura y extrae los datos en un JSON estricto.
+
+        REGLAS CLAVE PARA ESTE DOCUMENTO:
+        1. **DUPLICADOS:** Mira la esquina superior derecha. Si dice "Duplicado" o "Duplicate", marca "is_duplicate": true.
+        2. **CABECERA:** Extrae Factura (Invoice #), Fecha (Date), Orden (Order #), Referencia (Ref/File), B/L, Incoterm.
+        3. **DIRECCIONES:** Extrae el bloque completo de "Sold To" y "Ship To" en una sola línea de texto.
+        4. **TABLA DE PRODUCTOS (ITEMS):**
+           - **CUIDADO CON LA CANTIDAD:** A veces, las descripciones largas tienen números. NO los confundas con cantidades.
+           - **FILAS REALES:** Una fila debe tener Cantidad Y Precio.
+           - **UPC:** Si el código UPC empieza con 'A', cámbialo a '4'.
+           - **DESCRIPCIÓN:** Une el modelo y la descripción completa.
+
+        Retorna SOLO este JSON:
+        {
+            "is_duplicate": boolean,
+            "invoice_number": "string",
+            "date": "string",
+            "order": "string",
+            "ref": "string",
+            "bl": "string",
+            "incoterm": "string",
+            "sold_to": "string",
+            "ship_to": "string",
+            "items": [
+                {
+                    "qty": "number",
+                    "description": "string",
+                    "upc": "string",
+                    "unit_price": "number",
+                    "total": "number"
+                }
+            ]
+        }
+        """
+        
         response = model.generate_content([prompt, image])
-        
-        # Limpiamos la respuesta por si la IA pone ```json al principio
-        text_response = response.text.replace("```json", "").replace("```", "").strip()
-        
-        return json.loads(text_response)
+        # Limpieza de respuesta
+        text = response.text.replace("```json", "").replace("```", "").strip()
+        return json.loads(text)
         
     except Exception as e:
         return {"error": str(e)}
 
 # ==========================================
-# 🖥️ INTERFAZ PRINCIPAL
+# 🖥️ INTERFAZ
 # ==========================================
 
-uploaded_files = st.file_uploader("Sube tus Facturas (PDF)", type=["pdf"], accept_multiple_files=True)
+uploaded_files = st.file_uploader("Sube Facturas (PDF)", type=["pdf"], accept_multiple_files=True)
 
 if uploaded_files:
-    
     if not api_key:
-        st.warning("⚠️ Por favor ingresa tu API Key en la barra lateral para activar la IA.")
+        st.warning("⚠️ Pega tu API Key en la izquierda para continuar.")
         st.stop()
         
-    if st.button("🚀 Procesar con Inteligencia Artificial"):
+    if st.button("🚀 Procesar con IA"):
         
-        all_data_export = []
-        progress_bar = st.progress(0)
-        total_files = len(uploaded_files)
+        all_data = []
+        bar = st.progress(0)
         
-        for idx, uploaded_file in enumerate(uploaded_files):
-            with st.expander(f"📄 Procesando: {uploaded_file.name}", expanded=True):
+        for idx, file in enumerate(uploaded_files):
+            with st.expander(f"Procesando: {file.name}", expanded=True):
                 try:
-                    # 1. Convertir PDF a imágenes
-                    # Bajamos un poco el DPI porque a la IA no le importa tanto la ultra resolución como a Tesseract
-                    images = convert_from_bytes(uploaded_file.read(), dpi=200)
+                    # Convertir PDF (DPI 200 es suficiente para IA)
+                    images = convert_from_bytes(file.read(), dpi=200)
                     
+                    header_saved = {}
                     file_items = []
-                    header_info = {}
                     
-                    # 2. Analizar página por página
                     for i, img in enumerate(images):
-                        st.write(f"Analizando página {i+1} con Gemini...")
+                        st.write(f"Analizando pág {i+1}...")
+                        result = analyze_image_with_gemini(img, api_key)
                         
-                        # LLAMADA A LA IA
-                        data = analyze_image_with_gemini(img, api_key)
-                        
-                        # Verificar errores
-                        if "error" in data:
-                            st.error(f"Error en pág {i+1}: {data['error']}")
+                        if "error" in result:
+                            st.error(f"Error: {result['error']}")
                             continue
                             
-                        # Lógica de Duplicados
-                        if data.get("is_duplicate"):
-                            st.warning(f"⚠️ Página {i+1} marcada como DUPLICADO por la IA. Omitiendo.")
+                        # Filtro de Duplicados
+                        if result.get("is_duplicate"):
+                            st.warning(f"⚠️ Pág {i+1} es DUPLICADO. Ignorada.")
                             continue
                         
-                        st.success(f"✅ Página {i+1} procesada correctamente.")
+                        st.success(f"✅ Pág {i+1} OK.")
                         
-                        # Guardar cabecera (de la primera página válida)
-                        if not header_info:
-                            header_info = {
-                                "Factura": data.get("invoice_number"),
-                                "Fecha": data.get("date"),
-                                "Orden": data.get("order"),
-                                "Ref": data.get("ref"),
-                                "BL": data.get("bl"),
-                                "Incoterm": data.get("incoterm"),
-                                "Vendido A": data.get("sold_to"),
-                                "Embarcado A": data.get("ship_to")
+                        # Guardar cabecera de la primera página válida
+                        if not header_saved:
+                            header_saved = {
+                                "Factura": result.get("invoice_number"),
+                                "Fecha": result.get("date"),
+                                "Orden": result.get("order"),
+                                "Ref": result.get("ref"),
+                                "BL": result.get("bl"),
+                                "Incoterm": result.get("incoterm"),
+                                "Cliente": result.get("sold_to"),
+                                "Envio": result.get("ship_to")
                             }
                         
-                        # Acumular items
-                        for item in data.get("items", []):
-                            # Limpieza extra por si acaso
-                            flat_item = {
-                                "Cantidad": item.get("qty"),
-                                "Descripción": item.get("description"),
-                                "UPC": item.get("upc"),
-                                "Precio Unit.": item.get("unit_price"),
-                                "Total": item.get("total")
-                            }
-                            file_items.append(flat_item)
-                        
-                        # Pausa pequeña para no saturar la API (Rate Limiting)
-                        time.sleep(1) 
+                        # Guardar items
+                        for item in result.get("items", []):
+                            flat = item.copy()
+                            file_items.append(flat)
+                            
+                        time.sleep(1) # Pausa de cortesía
 
-                    # --- MOSTRAR RESULTADOS ---
-                    if header_info:
-                        c1, c2, c3 = st.columns(3)
-                        c1.info(f"Factura: {header_info.get('Factura')}")
-                        c2.info(f"Orden: {header_info.get('Orden')}")
-                        c3.metric("Total Items", len(file_items))
-                    
+                    # Mostrar Tabla
                     if file_items:
                         df = pd.DataFrame(file_items)
                         st.dataframe(df, use_container_width=True)
                         
-                        # Preparar para Excel Consolidado
+                        # Agregar al consolidado
                         for it in file_items:
-                            row = header_info.copy()
+                            row = header_saved.copy()
                             row.update(it)
-                            row['Archivo'] = uploaded_file.name
-                            all_data_export.append(row)
+                            row["Archivo"] = file.name
+                            all_data.append(row)
                     else:
-                        st.warning("La IA no encontró items o todas las páginas eran duplicadas.")
+                        st.warning("No se encontraron datos.")
 
                 except Exception as e:
-                    st.error(f"Error técnico con el archivo: {e}")
+                    st.error(f"Error crítico: {e}")
             
-            progress_bar.progress((idx + 1) / total_files)
+            bar.progress((idx + 1) / len(uploaded_files))
 
-        # --- EXCEL FINAL ---
-        if all_data_export:
-            df_final = pd.DataFrame(all_data_export)
-            
-            # Ordenar columnas
-            cols_order = ['Archivo', 'Factura', 'Fecha', 'Orden', 'Ref', 'BL', 'Incoterm', 
-                          'Vendido A', 'Embarcado A', 
-                          'Cantidad', 'Descripción', 'UPC', 'Precio Unit.', 'Total']
-            
-            final_cols = [c for c in cols_order if c in df_final.columns]
-            df_final = df_final[final_cols]
+        if all_data:
+            df_final = pd.DataFrame(all_data)
+            # Ordenar columnas si existen
+            cols = ["Archivo", "Factura", "Fecha", "Orden", "Ref", "BL", "Incoterm", "Cliente", "Envio", 
+                    "qty", "description", "upc", "unit_price", "total"]
+            final_cols = [c for c in cols if c in df_final.columns]
             
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-                df_final.to_excel(writer, sheet_name="Consolidado IA", index=False)
-                ws = writer.sheets['Consolidado IA']
-                ws.set_column('J:J', 10)
-                ws.set_column('K:K', 60)
-                
-            st.balloons()
-            st.success("✅ ¡Extracción Inteligente Completada!")
-            st.download_button("📥 Descargar Excel", buffer.getvalue(), "Reporte_Regal_AI.xlsx")
-
+                if not df_final.empty:
+                    df_final[final_cols].to_excel(writer, index=False)
+            
+            st.download_button("📥 Descargar Excel Final", buffer.getvalue(), "Reporte_IA.xlsx")
