@@ -8,7 +8,7 @@ import shutil
 import re
 
 # --- CONFIGURACIÓN ---
-st.set_page_config(page_title="Sistema OCR Aduana", layout="wide")
+st.set_page_config(page_title="Sistema OCR Aduana V22", layout="wide")
 st.title("🧰 Sistema de Extracción: Facturas & DUCA")
 
 if not shutil.which("tesseract"):
@@ -16,14 +16,14 @@ if not shutil.which("tesseract"):
     st.stop()
 
 # --- BARRA LATERAL ---
-st.sidebar.header("⚙️ Selecciona el Tipo de Documento")
+st.sidebar.header("⚙️ Tipo de Documento")
 modo_app = st.sidebar.radio(
-    "¿Qué vas a procesar?",
+    "Selecciona:",
     ["1. Facturas Regal Trading (Comercial)", "2. Declaración DUCA (Aduanas)"]
 )
 
 # ==============================================================================
-# 🧩 MÓDULO 1: REGAL TRADING (Tu versión V16 Intacta)
+# 🧩 MÓDULO 1: REGAL TRADING (Versión V16 - Estable)
 # ==============================================================================
 def clean_text_block(text):
     if not text: return ""
@@ -32,15 +32,13 @@ def clean_text_block(text):
 def clean_upc(text):
     if not text: return ""
     text = text.replace(" ", "").strip()
-    if len(text) > 8 and text.startswith("A"):
-        return "4" + text[1:]
+    if len(text) > 8 and text.startswith("A"): return "4" + text[1:]
     return text
 
 def extract_money(text_list):
     for text in reversed(text_list):
         clean = text.replace('$', '').replace('S', '').strip()
-        if re.search(r'\d+[.,]\d{2}', clean):
-            return clean
+        if re.search(r'\d+[.,]\d{2}', clean): return clean
     return ""
 
 def extract_items_regal(image):
@@ -71,8 +69,7 @@ def extract_items_regal(image):
             word = d['text'][i].strip()
             wy, wx = d['top'][i], d['left'][i]
             if (row_y - 20) <= wy <= (row_y + 20) and wx > X_UPC_END:
-                if re.search(r'\d+[.,]\d{2}', word) or '$' in word:
-                    has_price = True; break
+                if re.search(r'\d+[.,]\d{2}', word) or '$' in word: has_price = True; break
         if has_price: valid_anchors.append(cand)
     
     if not valid_anchors and candidates: valid_anchors = candidates
@@ -129,67 +126,53 @@ def is_duplicate(image):
     return bool(re.search(r'Duplicado', txt, re.IGNORECASE))
 
 # ==============================================================================
-# 🧩 MÓDULO 2: EXTRACTOR DUCA (NUEVO Y ESPECIALIZADO)
+# 🧩 MÓDULO 2: EXTRACTOR DUCA (CORREGIDO)
 # ==============================================================================
 
 def extract_duca_items(full_text):
     """
-    Parsea el texto completo de una página DUCA buscando patrones de items.
-    La DUCA siempre tiene la estructura: "22. Item" ... DATOS ... "38. Total"
+    Parsea la DUCA buscando bloques de items.
     """
     items = []
     
-    # Dividimos el texto en bloques usando "22. Item" como separador
-    # Esto aísla cada producto en su propio pedazo de texto
+    # Dividir por "22. Item"
     blocks = re.split(r'22\.\s*Item', full_text)
     
-    # El primer bloque (index 0) es cabecera general, lo saltamos
+    # Empezamos desde el bloque 1 (el 0 es basura del inicio)
     for i, block in enumerate(blocks[1:]):
         item_data = {}
         
-        # 1. Número de Item (Suele ser el primer número del bloque)
-        # Buscamos saltos de linea para encontrar la data real abajo de los headers
+        # 1. Descripción Comercial (Campo 29)
+        # Buscamos texto que esté después de "29. Descripción Comercial"
+        # y antes de la sección de valores (30. Valor FOB)
+        desc_match = re.search(r'29\.\s*Descripci.*?Comercial.*?\n(.*?)(?=\n|,|30\.)', block, re.DOTALL | re.IGNORECASE)
         
-        # A. Extracción de Datos Principales (Fila 1 del item)
-        # Patrón típico OCR: "1 \n CN \n 1.000 ..."
-        # Buscamos el peso, bultos y origen
-        weight_match = re.search(r'(\d+\.\d{2})\s+(\d+\.\d{3})', block) # Peso y Cuantía suelen estar juntos
-        if not weight_match:
-             # Intento alternativo
-             weight_match = re.search(r'Peso\s*[:\n]\s*(\d+\.\d{2})', block, re.IGNORECASE)
-        
-        # B. Descripción Comercial (Campo 29)
-        # Está entre el código arancelario y la siguiente sección (Valor FOB)
-        desc_match = re.search(r'Descripción Comercial\s*[:\.]?\s*\n?(.*?)(?=\n|30\.|Valor FOB)', block, re.DOTALL | re.IGNORECASE)
-        # Si falla el regex estricto, buscamos texto largo en mayusculas
-        if not desc_match:
-             # Buscamos texto después de los códigos numéricos grandes
+        # Fallback: A veces el OCR pone la descripción después del código arancelario grande
+        if not desc_match or len(desc_match.group(1)) < 3:
              desc_match = re.search(r'\d{8}\s+\n(.*?)\n', block)
              
-        # C. Valores Financieros (FOB, Flete, Seguro, Total)
-        # Buscamos la sección de abajo
-        # Patrón: FOB (x.xx) ... Total (x.xx)
-        fob_match = re.search(r'30\.\s*Valor FOB\s*[:\n]\s*([\d,]+\.\d{2})', block, re.IGNORECASE)
-        if not fob_match: 
-            # Búsqueda libre de monto grande si falla el header
-            fob_match = re.search(r'Valor FOB.*?\n.*?([\d,]+\.\d{2})', block, re.DOTALL)
-
-        total_match = re.search(r'38\.\s*Total\s*[:\n]\s*([\d,]+\.\d{2})', block, re.IGNORECASE)
+        # 2. Valor FOB (Campo 30)
+        # Buscamos números decimales cerca de "30. Valor FOB"
+        fob_match = re.search(r'30\.\s*Valor.*?FOB.*?\n.*?([\d,]+\.\d{2})', block, re.DOTALL | re.IGNORECASE)
+        
+        # 3. Total (Campo 38)
+        total_match = re.search(r'38\.\s*Total.*?\n.*?([\d,]+\.\d{2})', block, re.DOTALL | re.IGNORECASE)
+        # Si falla, buscamos el último precio del bloque
         if not total_match:
-             # El total suele ser el último número del bloque
-             prices = re.findall(r'([\d,]+\.\d{2})', block)
+             prices = re.findall(r'[\d,]+\.\d{2}', block)
              total_val = prices[-1] if prices else "0.00"
         else:
              total_val = total_match.group(1)
 
-        # --- ASIGNACIÓN ---
-        item_data['Item #'] = i + 1 # Autonumérico o extraído
-        item_data['Descripción'] = clean_text_block(desc_match.group(1)) if desc_match else "No detectada"
+        # ASIGNACIÓN
+        desc_text = desc_match.group(1).strip() if desc_match else "No detectada"
+        # Limpiar comillas y basura de la descripción
+        desc_text = desc_text.replace('"', '').replace(',', '').strip()
+        
+        item_data['Item #'] = i + 1
+        item_data['Descripción'] = desc_text
         item_data['Valor FOB'] = fob_match.group(1) if fob_match else "0.00"
         item_data['Total'] = total_val
-        
-        # Limpieza extra de descripción (quitar basura OCR)
-        item_data['Descripción'] = re.sub(r'[^a-zA-Z0-9\sñÑáéíóúÁÉÍÓÚ]', '', item_data['Descripción']).strip()
         
         items.append(item_data)
         
@@ -198,14 +181,15 @@ def extract_duca_items(full_text):
 def extract_duca_header(full_text):
     """Extrae datos generales de la DUCA"""
     header = {}
-    ref = re.search(r'Referencia\s*[:\n]\s*(\d+)', full_text, re.IGNORECASE)
+    
+    # Referencia (Campo 2)
+    ref = re.search(r'2\.\s*Referencia.*?\n\s*(\d+)', full_text, re.IGNORECASE)
+    if not ref: ref = re.search(r'Referencia\s*(\d+)', full_text)
     header['Referencia'] = ref.group(1) if ref else ""
     
-    fecha = re.search(r'Fecha Registro\s*[:\n]\s*(\d{2}/\d{2}/\d{4})', full_text, re.IGNORECASE)
+    # Fecha (Campo 3)
+    fecha = re.search(r'(\d{2}/\d{2}/\d{4})', full_text)
     header['Fecha'] = fecha.group(1) if fecha else ""
-    
-    declarante = re.search(r'Nombre y Dirección del Declarante\s*[:\n]\s*(.*?)\n', full_text, re.IGNORECASE)
-    header['Declarante'] = declarante.group(1) if declarante else ""
     
     return header
 
@@ -221,7 +205,7 @@ if uploaded_files:
     # MODO 1: REGAL TRADING
     # ---------------------------------------------------------
     if modo_app == "1. Facturas Regal Trading (Comercial)":
-        st.info("ℹ️ Modo: Facturas Comerciales (Estilo Tabla Regal).")
+        st.info("ℹ️ Modo: Facturas Comerciales.")
         if st.button("🚀 Extraer Regal"):
             all_data = []
             bar = st.progress(0)
@@ -258,7 +242,7 @@ if uploaded_files:
                 st.download_button("📥 Excel Regal", buffer.getvalue(), "Regal_Report.xlsx")
 
     # ---------------------------------------------------------
-    # MODO 2: DUCA ADUANAS
+    # MODO 2: DUCA ADUANAS (CORREGIDO)
     # ---------------------------------------------------------
     elif modo_app == "2. Declaración DUCA (Aduanas)":
         st.info("ℹ️ Modo: Documentos de Aduana (DUCA Simplificada).")
@@ -269,19 +253,18 @@ if uploaded_files:
             
             for idx, f in enumerate(uploaded_files):
                 try:
-                    # DUCA necesita texto completo de la página, no coordenadas
+                    # Leemos con DPI alto para ver bien los números
                     images = convert_from_bytes(f.read(), dpi=300)
                     
                     header_duca = {}
                     
                     for i, img in enumerate(images):
-                        # Extraer todo el texto de la página
-                        # Usamos psm 4 (single column) para leer en orden de flujo
+                        # Psm 4 para leer bloques de texto (importante para DUCA)
                         full_text = pytesseract.image_to_string(img, lang='spa', config='--psm 4')
                         
-                        # Primera página tiene cabecera
+                        # Extraer cabecera solo de la pág 1
                         if i == 0:
-                            header_duca = extract_header_duca(full_text)
+                            header_duca = extract_duca_header(full_text)
                         
                         # Extraer items de esta página
                         page_items = extract_duca_items(full_text)
@@ -307,9 +290,9 @@ if uploaded_files:
                 with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
                     df_duca.to_excel(writer, index=False)
                     ws = writer.sheets['Sheet1']
-                    ws.set_column('F:F', 50) # Descripción ancha
+                    ws.set_column('F:F', 50) 
                 
                 st.success("✅ DUCA Procesada")
                 st.download_button("📥 Descargar Excel DUCA", buffer.getvalue(), "Reporte_DUCA.xlsx")
             else:
-                st.warning("No se encontraron items DUCA. Asegúrate que el PDF sea legible.")
+                st.warning("No se encontraron items DUCA.")
