@@ -1,40 +1,133 @@
 import streamlit as st
-import pytesseract
-from pytesseract import Output
-from pdf2image import convert_from_bytes
+import camelot
 import pandas as pd
 import io
-import shutil
-import re
-import json
-import time
-import google.generativeai as genai
+import os
+import tempfile
 
 # --- CONFIGURACIÓN ---
-st.set_page_config(page_title="Sistema Híbrido OCR+IA", layout="wide")
-st.title("🤖 Sistema de Extracción Inteligente (Híbrido)")
+st.set_page_config(page_title="Extractor de Tablas (Camelot)", layout="wide")
+st.title("📊 Extractor de Tablas SAC (Camelot)")
 
-if not shutil.which("tesseract"):
-    st.error("❌ Error Crítico: Tesseract no está instalado.")
-    st.stop()
+st.info("Esta herramienta usa 'Camelot', una librería especializada en detectar tablas dentro de PDFs.")
 
 # --- BARRA LATERAL ---
 with st.sidebar:
     st.header("⚙️ Configuración")
     
-    # Selector de Motor
-    modo_app = st.radio(
-        "Selecciona el Motor:",
-        ["1. Regal Trading (Tesseract V16)", 
-         "2. DUCA Aduanas (Tesseract V24)", 
-         "3. IA Gemini (Para casos difíciles)"]
+    # Selector de Modo de Camelot
+    flavor = st.radio(
+        "Tipo de Tabla:",
+        ["Lattice (Tiene líneas/bordes)", "Stream (Solo espacios blancos)"],
+        index=0
     )
+    flavor_code = 'lattice' if 'Lattice' in flavor else 'stream'
     
-    st.divider()
+    st.markdown("---")
+    st.write("**Rango de Páginas:**")
+    st.caption("El SAC es grande. Prueba con pocas páginas primero.")
+    page_mode = st.radio("Selección:", ["Todas", "Rango"])
     
-    # API Key para Modo 3
-    api_key = ""
-    if modo_app == "3. IA Gemini (Para casos difíciles)":
+    pages_arg = 'all'
+    if page_mode == "Rango":
+        pages_arg = st.text_input("Ej: 1, 2-5, 10", "1-5")
+
+# ==========================================
+# 🧠 LÓGICA CAMELOT
+# ==========================================
+
+def process_pdf_camelot(file_path, pages, mode):
+    """
+    Ejecuta Camelot para extraer tablas.
+    """
+    try:
+        # Camelot lee el archivo y busca tablas
+        tables = camelot.read_pdf(file_path, pages=pages, flavor=mode, strip_text='\n')
+        return tables
+    except Exception as e:
+        return str(e)
+
+# ==========================================
+# 🖥️ INTERFAZ
+# ==========================================
+
+uploaded_file = st.file_uploader("Sube el archivo SAC (PDF)", type=["pdf"])
+
+if uploaded_file is not None:
+    
+    if st.button("🚀 Extraer Tablas"):
+        
+        with st.status("Procesando PDF (Esto puede tardar)...", expanded=True) as status:
+            try:
+                # 1. Guardar archivo temporalmente (Camelot necesita un archivo físico, no bytes)
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+                    tmp_file.write(uploaded_file.read())
+                    tmp_path = tmp_file.name
+                
+                st.write(f"Leyendo páginas: {pages_arg} en modo {flavor_code}...")
+                
+                # 2. Ejecutar Camelot
+                camelot_tables = process_pdf_camelot(tmp_path, pages_arg, flavor_code)
+                
+                # Borrar archivo temporal
+                os.remove(tmp_path)
+                
+                if isinstance(camelot_tables, str): # Si devolvió error
+                    status.update(label="Error", state="error")
+                    st.error(f"Error de Camelot: {camelot_tables}")
+                    st.warning("Intenta cambiar el 'Tipo de Tabla' en la izquierda.")
+                
+                elif len(camelot_tables) > 0:
+                    status.update(label="¡Tablas Encontradas!", state="complete")
+                    st.success(f"✅ Se detectaron {len(camelot_tables)} tablas.")
+                    
+                    # 3. Unir todas las tablas en un solo DataFrame
+                    all_dfs = []
+                    
+                    # Mostrar las primeras tablas como ejemplo
+                    st.subheader("Vista Previa (Primeras 3 tablas):")
+                    
+                    for i, table in enumerate(camelot_tables):
+                        df = table.df # Convertir a Pandas
+                        
+                        # Limpieza básica: Usar la primera fila como header si parece texto
+                        # (Opcional, depende del SAC)
+                        # df.columns = df.iloc[0] 
+                        # df = df[1:]
+                        
+                        all_dfs.append(df)
+                        
+                        if i < 3:
+                            with st.expander(f"Tabla {i+1} (Página {table.page})", expanded=True):
+                                st.dataframe(df, use_container_width=True)
+                                st.caption(f"Precisión de lectura: {table.accuracy:.2f}%")
+
+                    # 4. Generar Excel Consolidado
+                    if all_dfs:
+                        # Concatenar todo (Cuidado: si las columnas cambian, esto puede desordenarse)
+                        # Para el SAC, usualmente la estructura es constante.
+                        df_final = pd.concat(all_dfs, ignore_index=True)
+                        
+                        buffer = io.BytesIO()
+                        with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+                            df_final.to_excel(writer, index=False, sheet_name="Tablas_SAC")
+                            
+                            # Ajustar columnas
+                            worksheet = writer.sheets['Tablas_SAC']
+                            worksheet.set_column('A:Z', 20)
+                        
+                        st.download_button(
+                            label="📥 Descargar Excel con Tablas",
+                            data=buffer.getvalue(),
+                            file_name="Tablas_SAC_Extraidas.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        )
+                else:
+                    status.update(label="Sin resultados", state="error")
+                    st.warning("No se detectaron tablas. Prueba cambiando a modo 'Stream' en la barra lateral.")
+                    
+            except Exception as e:
+                st.error(f"Error crítico: {e}")    if modo_app == "3. IA Gemini (Para casos difíciles)":
         api_key = st.text_input("🔑 Google API Key", type="password")
         st.caption("Obtenla gratis en Google AI Studio")
 
@@ -325,3 +418,4 @@ if uploaded_files:
                     df.to_excel(writer, index=False)
                 st.success("✅ IA Finalizada")
                 st.download_button("📥 Excel IA", buffer.getvalue(), "IA_Report.xlsx")
+
