@@ -5,12 +5,12 @@ import io
 import os
 import tempfile
 import shutil
-import gc  # Garbage Collector para liberar RAM
-from pypdf import PdfReader # Para contar páginas rápido
+import gc
+from pypdf import PdfReader
 
 # --- CONFIGURACIÓN ---
-st.set_page_config(page_title="Extractor SAC V5 (Automático)", layout="wide")
-st.title("📊 Extractor SAC (Procesamiento por Lotes)")
+st.set_page_config(page_title="Extractor SAC V6 (Disco)", layout="wide")
+st.title("📊 Extractor SAC (Modo Seguro de Memoria)")
 
 if not shutil.which("gs"):
     st.error("❌ Error Crítico: Ghostscript no está instalado. Revisa packages.txt")
@@ -19,17 +19,15 @@ if not shutil.which("gs"):
 # --- BARRA LATERAL ---
 with st.sidebar:
     st.header("⚙️ Configuración")
-    st.info("Este modo divide el PDF automáticamente para evitar colapsos de memoria.")
+    st.info("Este modo escribe en disco paso a paso para no saturar la memoria RAM.")
     
-    # Tamaño del lote (Batch size)
-    batch_size = st.slider("Páginas por lote:", min_value=10, max_value=50, value=20, 
-                           help="Menos páginas = Menos RAM usada, pero más lento.")
+    # Lote pequeño para seguridad
+    batch_size = st.slider("Páginas por lote:", 5, 50, 10)
 
 # ==========================================
 # 🧠 LÓGICA DE LIMPIEZA
 # ==========================================
 def clean_sac_data(df):
-    """Limpia la tabla cruda"""
     if df.shape[1] < 3: return None
     
     # Quedarse con las 3 primeras columnas
@@ -41,128 +39,136 @@ def clean_sac_data(df):
     bad_words = ["CÓDIGO", "CODIGO", "SAC", "DESCRIPCIÓN", "DAI", "CAPÍTULO", "NOTAS", "SECCIÓN"]
     pattern = '|'.join(bad_words)
     
-    # Eliminar filas de encabezado repetido
     df = df[~df["CODIGO"].str.contains(pattern, case=False, na=False)]
     df = df[df["CODIGO"] != df["DESCRIPCION"]]
     df = df.dropna(how='all')
-    
-    # Limpiar texto
     df = df.replace(r'\n', ' ', regex=True)
     return df
 
 # ==========================================
-# 🚜 MOTOR DE LOTES (BATCH ENGINE)
+# 🚜 MOTOR DE ESCRITURA EN DISCO (V6)
 # ==========================================
-def process_full_document(file_bytes, batch_size):
-    # 1. Guardar archivo temporal
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        tmp.write(file_bytes)
-        tmp_path = tmp.name
+def process_massive_pdf(file_bytes, batch_size):
+    # Archivos temporales
+    temp_pdf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    temp_csv = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
+    
+    temp_pdf.write(file_bytes)
+    temp_pdf.close() # Cerramos escritura, mantenemos path
+    
+    pdf_path = temp_pdf.name
+    csv_path = temp_csv.name
+    temp_csv.close() # Cerramos para que pandas pueda escribir
 
     try:
-        # 2. Contar páginas totales
-        reader = PdfReader(tmp_path)
+        reader = PdfReader(pdf_path)
         total_pages = len(reader.pages)
         
-        st.info(f"📄 Documento detectado: {total_pages} páginas. Iniciando procesamiento en lotes de {batch_size}...")
-        
-        # Barra de progreso
-        progress_bar = st.progress(0)
+        status_bar = st.progress(0)
         status_text = st.empty()
         
-        all_dataframes = []
+        total_rows_extracted = 0
+        first_batch = True
         
-        # 3. BUCLE DE PROCESAMIENTO
-        # Itera desde la pág 1 hasta la última, saltando de 20 en 20
+        # BUCLE POR LOTES
         for i, start_page in enumerate(range(1, total_pages + 1, batch_size)):
-            
-            # Calcular fin del lote (ej: 1-20, 21-40...)
             end_page = min(start_page + batch_size - 1, total_pages)
             pages_arg = f"{start_page}-{end_page}"
             
-            status_text.text(f"⏳ Procesando lote {i+1}: Páginas {pages_arg}...")
+            status_text.write(f"⏳ Procesando páginas {pages_arg} de {total_pages}...")
             
             try:
-                # CAMELOT: Lee solo este pedacito
-                tables = camelot.read_pdf(tmp_path, pages=pages_arg, flavor='lattice', strip_text='\n')
+                # 1. Extraer (Solo este pedacito)
+                tables = camelot.read_pdf(pdf_path, pages=pages_arg, flavor='lattice', strip_text='\n')
                 
-                # Limpiar y acumular
+                # 2. Limpiar y consolidar lote en memoria RAM pequeña
+                batch_df = pd.DataFrame()
                 for t in tables:
                     clean = clean_sac_data(t.df)
                     if clean is not None and not clean.empty:
-                        all_dataframes.append(clean)
+                        batch_df = pd.concat([batch_df, clean], ignore_index=True)
+                
+                # 3. ESCRIBIR EN DISCO INMEDIATAMENTE (Append Mode)
+                if not batch_df.empty:
+                    # Si es el primer lote, escribimos encabezados. Si no, solo datos.
+                    batch_df.to_csv(csv_path, mode='a', header=first_batch, index=False, encoding='utf-8-sig')
+                    total_rows_extracted += len(batch_df)
+                    first_batch = False
+                
+                # 4. LIBERAR MEMORIA AGRESIVAMENTE
+                del tables
+                del batch_df
+                gc.collect()
                 
             except Exception as e:
-                st.warning(f"⚠️ Error menor en páginas {pages_arg}: {e}")
-            
-            # 4. LIMPIEZA DE MEMORIA (CRÍTICO)
-            # Borramos las tablas de Camelot de la memoria RAM
-            del tables
-            gc.collect() # Forzamos al sistema a liberar espacio
+                # Si falla una pagina, seguimos con la siguiente
+                print(f"Error en lote {pages_arg}: {e}")
             
             # Actualizar barra
-            progress_bar.progress(min(end_page / total_pages, 1.0))
+            status_bar.progress(min(end_page / total_pages, 1.0))
 
-        status_text.text("✅ Procesamiento finalizado. Unificando datos...")
+        status_text.success("✅ Extracción finalizada. Generando archivos de descarga...")
         
-        # 5. CONSOLIDACIÓN FINAL
-        if all_dataframes:
-            master_df = pd.concat(all_dataframes, ignore_index=True)
-            return master_df
-        else:
-            return None
+        return csv_path, total_rows_extracted
 
     except Exception as e:
         st.error(f"Error fatal: {e}")
-        return None
+        return None, 0
     finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        if os.path.exists(pdf_path): os.remove(pdf_path)
 
 # ==========================================
-# 🖥️ INTERFAZ PRINCIPAL
+# 🖥️ INTERFAZ
 # ==========================================
 
-uploaded_file = st.file_uploader("Sube el archivo SAC Completo (PDF)", type=["pdf"])
+uploaded_file = st.file_uploader("Sube el SAC Completo (PDF)", type=["pdf"])
 
 if uploaded_file is not None:
-    
-    if st.button("🚀 Procesar Todo el Documento"):
+    if st.button("🚀 Procesar Documento Gigante"):
         
-        # Ejecutar motor
-        df_result = process_full_document(uploaded_file.read(), batch_size)
+        csv_path, rows = process_massive_pdf(uploaded_file.read(), batch_size)
         
-        if df_result is not None and not df_result.empty:
+        if rows > 0:
             st.balloons()
-            st.success(f"✅ ¡Éxito! Se extrajeron {len(df_result)} filas en total.")
+            st.success(f"✅ Se han extraído {rows} filas de datos.")
             
-            # Vista Previa (Primeras filas)
-            st.write("### Muestra de Datos:")
-            st.dataframe(df_result.head(100), use_container_width=True)
-            
-            # EXCEL
-            buffer = io.BytesIO()
-            with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-                df_result.to_excel(writer, index=False, sheet_name="SAC_Completo")
+            # Opción 1: Descargar CSV (Súper rápido y seguro)
+            with open(csv_path, "rb") as f:
+                csv_bytes = f.read()
                 
-                # Formato
-                workbook = writer.book
-                ws = writer.sheets['SAC_Completo']
-                header_fmt = workbook.add_format({'bold': True, 'bg_color': '#2C3E50', 'font_color': 'white'})
-                ws.set_row(0, None, header_fmt)
-                
-                ws.set_column('A:A', 15) # Código
-                ws.set_column('B:B', 80) # Desc
-                ws.set_column('C:C', 10) # DAI
-                
-                wrap = workbook.add_format({'text_wrap': True, 'valign': 'top'})
-                ws.set_column('A:C', None, wrap)
-            
             st.download_button(
-                label="📥 Descargar SAC Completo (.xlsx)",
-                data=buffer.getvalue(),
-                file_name="SAC_Maestro_Completo.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                "📥 Descargar CSV (Recomendado - Más ligero)",
+                data=csv_bytes,
+                file_name="SAC_Completo.csv",
+                mime="text/csv"
             )
+            
+            # Opción 2: Intentar Convertir a Excel (Puede tardar)
+            st.write("---")
+            st.info("Generando Excel... (Si esto falla, usa el botón de CSV de arriba)")
+            
+            try:
+                # Leemos el CSV del disco para pasarlo a Excel
+                # Chunksize ayuda a no saturar memoria al leer para convertir
+                df_final = pd.read_csv(csv_path)
+                
+                buffer = io.BytesIO()
+                with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+                    df_final.to_excel(writer, index=False, sheet_name="SAC")
+                    ws = writer.sheets['SAC']
+                    ws.set_column('B:B', 80)
+                
+                st.download_button(
+                    "📥 Descargar Excel (.xlsx)",
+                    data=buffer.getvalue(),
+                    file_name="SAC_Completo.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+            except Exception as e:
+                st.error(f"El Excel es demasiado grande para generarlo aquí. Por favor descarga el CSV. Error: {e}")
+            
+            # Limpieza final
+            if os.path.exists(csv_path): os.remove(csv_path)
+            
         else:
-            st.error("No se pudieron extraer datos. Puede que el PDF no tenga tablas legibles o esté encriptado.")
+            st.warning("No se encontraron datos o hubo un error en la lectura.")
