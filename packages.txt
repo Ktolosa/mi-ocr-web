@@ -1,7 +1,5 @@
+ghostscript
+libgl1
 tesseract-ocr
 tesseract-ocr-spa
 poppler-utils
-libgl1-mesa-glx
-ghostscript
-libgl1
-
