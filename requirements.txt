@@ -4,3 +4,5 @@ opencv-python-headless
 pandas
 xlsxwriter
 pdf2image
+pytesseract
+pypdf
