@@ -5,100 +5,167 @@ import io
 import os
 import tempfile
 import shutil
+import re
 
 # --- CONFIGURACIÓN ---
-st.set_page_config(page_title="Extractor SAC (Camelot)", layout="wide")
-st.title("📊 Extractor de Tablas SAC (Camelot)")
+st.set_page_config(page_title="SAC Cleaner V2", layout="wide")
+st.title("📊 Extractor SAC (Solo Datos Limpios)")
 
-# Verificar Ghostscript (Vital para Camelot)
+# Verificar Dependencias
 if not shutil.which("gs"):
-    st.error("❌ Error: Ghostscript no está instalado. Revisa packages.txt")
+    st.error("❌ Error Crítico: Ghostscript no está instalado.")
     st.stop()
 
 # --- BARRA LATERAL ---
 with st.sidebar:
     st.header("⚙️ Configuración")
+    st.info("Este modo usa 'Camelot Lattice' para detectar cuadrículas y elimina todo lo que no sea dato.")
     
-    # El SAC suele tener líneas, así que 'lattice' es mejor por defecto
-    flavor = st.radio("Método de Detección:", ["Lattice (Líneas)", "Stream (Espacios)"], index=0)
-    flavor_code = 'lattice' if 'Lattice' in flavor else 'stream'
+    # Rango de páginas (Vital para el SAC)
+    pages_input = st.text_input("Rango de páginas (Ej: 10-20)", "10-15")
     
-    st.info("El SAC es un archivo pesado. Procesa por rangos de páginas para no saturar la memoria.")
-    pages_input = st.text_input("Páginas a leer (Ej: 10-20, 50, all)", "10-15")
+    st.divider()
+    st.write("Estructura de Salida:")
+    st.code("Col 1: CÓDIGO\nCol 2: DESCRIPCIÓN\nCol 3: DAI %")
 
 # ==========================================
-# 🧠 MOTOR CAMELOT
+# 🧠 LÓGICA DE LIMPIEZA INTELIGENTE
 # ==========================================
-def extract_tables_camelot(file_bytes, pages, mode):
-    # Guardar temporalmente porque Camelot necesita archivo físico
+
+def clean_sac_data(df):
+    """
+    Recibe un DataFrame crudo de Camelot y lo limpia agresivamente.
+    """
+    # 1. SELECCIÓN DE COLUMNAS
+    # El SAC suele tener: Código | Descripción | DAI | ISC | Otros...
+    # Nos quedamos estrictamente con las primeras 3 columnas (0, 1, 2)
+    if df.shape[1] < 3:
+        return None # Tabla inservible o mal detectada
+    
+    df = df.iloc[:, 0:3] 
+    
+    # Renombrar para estandarizar
+    df.columns = ["CODIGO", "DESCRIPCION", "DAI"]
+    
+    # 2. LIMPIEZA DE FILAS (El paso más importante)
+    # Convertimos a string para poder buscar palabras clave
+    df["CODIGO"] = df["CODIGO"].astype(str)
+    
+    # Definimos palabras "prohibidas" que indican que la fila NO es un dato
+    # (Encabezados de tabla, Títulos de Capítulo, Notas al pie que quedaron dentro)
+    bad_words = [
+        "CÓDIGO", "CODIGO", "SAC", "DESCRIPCIÓN", "DESCRIPCION", 
+        "TASA", "DAI", "DERECHOS", "CAPÍTULO", "SECCIÓN", "NOTAS"
+    ]
+    
+    # Regex para encontrar cualquiera de esas palabras (ignorando mayúsculas/minúsculas)
+    pattern = '|'.join(bad_words)
+    
+    # Filtro 1: Eliminar filas donde la columna CODIGO tenga esas palabras
+    df = df[~df["CODIGO"].str.contains(pattern, case=False, na=False)]
+    
+    # Filtro 2: Eliminar filas donde la DESCRIPCIÓN sea igual al CÓDIGO (error común de merge)
+    df = df[df["CODIGO"] != df["DESCRIPCION"]]
+    
+    # Filtro 3: Eliminar filas totalmente vacías
+    df = df.dropna(how='all')
+    
+    # 3. LIMPIEZA DE TEXTO
+    # Quitar saltos de línea internos (\n) que rompen el Excel
+    df = df.replace(r'\n', ' ', regex=True)
+    
+    return df
+
+def process_sac_pdf(file_bytes, pages):
+    # Guardar temporalmente
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(file_bytes)
         tmp_path = tmp.name
     
     try:
-        # Ejecutar extracción
-        tables = camelot.read_pdf(tmp_path, pages=pages, flavor=mode, strip_text='\n')
-        return tables, tmp_path
+        # Ejecutar Camelot en modo Lattice (Red)
+        # Esto ignora automáticamente el texto que está FUERA de las tablas (títulos de página)
+        tables = camelot.read_pdf(tmp_path, pages=pages, flavor='lattice', strip_text='\n')
+        
+        if len(tables) == 0:
+            return None, "No se encontraron tablas."
+            
+        master_df = pd.DataFrame()
+        
+        # Iterar y consolidar
+        for table in tables:
+            df = table.df
+            
+            # Limpiar esta tabla específica
+            clean_df = clean_sac_data(df)
+            
+            if clean_df is not None and not clean_df.empty:
+                master_df = pd.concat([master_df, clean_df], ignore_index=True)
+                
+        return master_df, None
+        
     except Exception as e:
         return None, str(e)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 # ==========================================
-# 🖥️ INTERFAZ
+# 🖥️ INTERFAZ PRINCIPAL
 # ==========================================
-uploaded_file = st.file_uploader("Sube el archivo SAC (PDF)", type=["pdf"])
+
+uploaded_file = st.file_uploader("Cargar SAC (PDF)", type=["pdf"])
 
 if uploaded_file is not None:
-    if st.button("🚀 Extraer Tablas"):
+    if st.button("🚀 Extraer y Limpiar"):
         
-        with st.status("Procesando PDF (Esto puede tardar)...", expanded=True) as status:
-            # Extracción
-            tables, error_path = extract_tables_camelot(uploaded_file.read(), pages_input, flavor_code)
+        with st.status("Analizando estructura del documento...", expanded=True) as status:
             
-            # Limpieza archivo temporal
-            if isinstance(tables, str): # Si hubo error antes de retornar
-                pass 
-            elif error_path and os.path.exists(error_path):
-                os.remove(error_path)
-
-            if tables is None or isinstance(tables, str):
+            # Procesar
+            df_final, error = process_sac_pdf(uploaded_file.read(), pages_input)
+            
+            if error:
                 status.update(label="Error", state="error")
-                st.error(f"Error técnico: {error_path}")
+                st.error(f"Error técnico: {error}")
             
-            elif len(tables) > 0:
-                status.update(label="¡Completado!", state="complete")
-                st.success(f"✅ Se encontraron {len(tables)} tablas en las páginas {pages_input}.")
+            elif df_final is not None and not df_final.empty:
+                status.update(label="¡Extracción Finalizada!", state="complete")
                 
-                # Consolidar en un solo Excel
-                all_dfs = []
+                rows_count = len(df_final)
+                st.success(f"✅ Se han extraído y unificado **{rows_count}** filas de productos.")
+                
+                # Vista Previa
+                st.write("### Vista Previa de Datos Limpios:")
+                st.dataframe(df_final.head(10), use_container_width=True)
+                
+                # Generar Excel
                 buffer = io.BytesIO()
-                
                 with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-                    # Hoja Consolidada
-                    row_pointer = 0
+                    df_final.to_excel(writer, index=False, sheet_name="SAC_Consolidado")
                     
-                    for i, table in enumerate(tables):
-                        df = table.df
-                        all_dfs.append(df)
-                        
-                        # Escribir cada tabla en su propia hoja también (opcional)
-                        sheet_name = f"Tabla_{i+1}_Pag{table.page}"
-                        df.to_excel(writer, sheet_name=sheet_name, index=False, header=False)
+                    # Formato estético
+                    workbook = writer.book
+                    worksheet = writer.sheets['SAC_Consolidado']
                     
-                    # Crear hoja maestra unida
-                    if all_dfs:
-                        master_df = pd.concat(all_dfs, ignore_index=True)
-                        master_df.to_excel(writer, sheet_name="CONSOLIDADO", index=False, header=False)
-                
-                # Mostrar vista previa de la primera tabla detectada
-                st.subheader("Vista Previa (Tabla 1):")
-                st.dataframe(tables[0].df, use_container_width=True)
-                
+                    # Estilo de cabecera
+                    header_fmt = workbook.add_format({'bold': True, 'bg_color': '#D9E1F2', 'border': 1})
+                    worksheet.set_row(0, None, header_fmt)
+                    
+                    # Anchos
+                    worksheet.set_column('A:A', 15) # Código
+                    worksheet.set_column('B:B', 70) # Descripción (Muy ancha)
+                    worksheet.set_column('C:C', 10) # DAI
+                    
+                    # Ajuste de texto
+                    wrap_fmt = workbook.add_format({'text_wrap': True, 'valign': 'top'})
+                    worksheet.set_column('B:B', 70, wrap_fmt)
+
                 st.download_button(
-                    "📥 Descargar Excel SAC",
+                    label="📥 Descargar Excel Unificado",
                     data=buffer.getvalue(),
-                    file_name="SAC_Tablas.xlsx",
+                    file_name="SAC_Limpio.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
             else:
-                status.update(label="Sin resultados", state="error")
-                st.warning("No se encontraron tablas. Prueba cambiando el método a 'Stream' o ajusta el rango de páginas.")
+                status.update(label="Vacío", state="error")
+                st.warning("Se detectaron tablas pero estaban vacías después de la limpieza. Revisa el rango de páginas.")
