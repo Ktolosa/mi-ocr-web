@@ -4,5 +4,3 @@ opencv-python-headless
 pandas
 xlsxwriter
 pdf2image
-pytesseract
-google-generativeai>=0.7.2
