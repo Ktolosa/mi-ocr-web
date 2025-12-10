@@ -1,174 +1,152 @@
 import streamlit as st
-import camelot
 import pandas as pd
-import io
-import os
+import google.generativeai as genai
+from pdf2image import convert_from_path
 import tempfile
-import shutil
-import gc
-from pypdf import PdfReader
+import os
+import json
+import time
 
 # --- CONFIGURACIÓN ---
-st.set_page_config(page_title="Extractor SAC V6 (Disco)", layout="wide")
-st.title("📊 Extractor SAC (Modo Seguro de Memoria)")
+st.set_page_config(page_title="Extractor SAC con Gemini AI", layout="wide")
+st.title("🤖 Extractor SAC Potenciado por Google Gemini")
 
-if not shutil.which("gs"):
-    st.error("❌ Error Crítico: Ghostscript no está instalado. Revisa packages.txt")
+# Configurar API Key desde los secretos de Streamlit
+# Si estás en local sin secrets.toml, asegúrate de tener la variable de entorno seteada
+if "GOOGLE_API_KEY" in st.secrets:
+    genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
+else:
+    st.error("❌ Falta la API KEY. Configura 'GOOGLE_API_KEY' en los secrets de Streamlit.")
     st.stop()
 
-# --- BARRA LATERAL ---
-with st.sidebar:
-    st.header("⚙️ Configuración")
-    st.info("Este modo escribe en disco paso a paso para no saturar la memoria RAM.")
-    
-    # Lote pequeño para seguridad
-    batch_size = st.slider("Páginas por lote:", 5, 50, 10)
+# Usamos Gemini 1.5 Flash (Rápido, barato y excelente con imágenes/documentos)
+model = genai.GenerativeModel('gemini-1.5-flash')
 
 # ==========================================
-# 🧠 LÓGICA DE LIMPIEZA
+# 🧠 CEREBRO GEMINI (OCR + ESTRUCTURACIÓN)
 # ==========================================
-def clean_sac_data(df):
-    if df.shape[1] < 3: return None
+def analizar_imagen_con_gemini(image):
+    """
+    Envía una imagen (página del PDF) a Gemini y le pide JSON estructurado.
+    """
+    prompt = """
+    Actúa como un experto digitador de aduanas y OCR avanzado.
+    Analiza esta imagen de un documento SAC (Sistema Arancelario Centroamericano).
     
-    # Quedarse con las 3 primeras columnas
-    df = df.iloc[:, 0:3]
-    df.columns = ["CODIGO", "DESCRIPCION", "DAI"]
+    Tu tarea:
+    1. Identifica la tabla de códigos arancelarios.
+    2. Extrae TODOS los registros visibles.
+    3. Ignora encabezados de página, números de página o notas al pie.
+    4. Si una descripción abarca varias líneas visuales, únelas en una sola cadena de texto.
+    5. Devuelve EXCLUSIVAMENTE una lista de objetos JSON con este formato exacto:
+       [{"CODIGO": "0101.21.00", "DESCRIPCION": "Caballos reproductores de raza pura", "DAI": "0"}, ...]
     
-    # Filtro de basura
-    df["CODIGO"] = df["CODIGO"].astype(str)
-    bad_words = ["CÓDIGO", "CODIGO", "SAC", "DESCRIPCIÓN", "DAI", "CAPÍTULO", "NOTAS", "SECCIÓN"]
-    pattern = '|'.join(bad_words)
+    Salida requerida: Solo el array JSON, sin bloques de código markdown (```json), sin texto introductorio.
+    """
     
-    df = df[~df["CODIGO"].str.contains(pattern, case=False, na=False)]
-    df = df[df["CODIGO"] != df["DESCRIPCION"]]
-    df = df.dropna(how='all')
-    df = df.replace(r'\n', ' ', regex=True)
-    return df
-
-# ==========================================
-# 🚜 MOTOR DE ESCRITURA EN DISCO (V6)
-# ==========================================
-def process_massive_pdf(file_bytes, batch_size):
-    # Archivos temporales
-    temp_pdf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-    temp_csv = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
-    
-    temp_pdf.write(file_bytes)
-    temp_pdf.close() # Cerramos escritura, mantenemos path
-    
-    pdf_path = temp_pdf.name
-    csv_path = temp_csv.name
-    temp_csv.close() # Cerramos para que pandas pueda escribir
-
     try:
-        reader = PdfReader(pdf_path)
-        total_pages = len(reader.pages)
+        # Enviamos el prompt + la imagen
+        response = model.generate_content([prompt, image])
+        texto_respuesta = response.text.strip()
         
-        status_bar = st.progress(0)
-        status_text = st.empty()
-        
-        total_rows_extracted = 0
-        first_batch = True
-        
-        # BUCLE POR LOTES
-        for i, start_page in enumerate(range(1, total_pages + 1, batch_size)):
-            end_page = min(start_page + batch_size - 1, total_pages)
-            pages_arg = f"{start_page}-{end_page}"
+        # Limpieza por si Gemini devuelve bloques markdown
+        if "```json" in texto_respuesta:
+            texto_respuesta = texto_respuesta.replace("```json", "").replace("```", "")
+        if "```" in texto_respuesta:
+            texto_respuesta = texto_respuesta.replace("```", "")
             
-            status_text.write(f"⏳ Procesando páginas {pages_arg} de {total_pages}...")
-            
-            try:
-                # 1. Extraer (Solo este pedacito)
-                tables = camelot.read_pdf(pdf_path, pages=pages_arg, flavor='lattice', strip_text='\n')
-                
-                # 2. Limpiar y consolidar lote en memoria RAM pequeña
-                batch_df = pd.DataFrame()
-                for t in tables:
-                    clean = clean_sac_data(t.df)
-                    if clean is not None and not clean.empty:
-                        batch_df = pd.concat([batch_df, clean], ignore_index=True)
-                
-                # 3. ESCRIBIR EN DISCO INMEDIATAMENTE (Append Mode)
-                if not batch_df.empty:
-                    # Si es el primer lote, escribimos encabezados. Si no, solo datos.
-                    batch_df.to_csv(csv_path, mode='a', header=first_batch, index=False, encoding='utf-8-sig')
-                    total_rows_extracted += len(batch_df)
-                    first_batch = False
-                
-                # 4. LIBERAR MEMORIA AGRESIVAMENTE
-                del tables
-                del batch_df
-                gc.collect()
-                
-            except Exception as e:
-                # Si falla una pagina, seguimos con la siguiente
-                print(f"Error en lote {pages_arg}: {e}")
-            
-            # Actualizar barra
-            status_bar.progress(min(end_page / total_pages, 1.0))
-
-        status_text.success("✅ Extracción finalizada. Generando archivos de descarga...")
+        return json.loads(texto_respuesta)
         
-        return csv_path, total_rows_extracted
-
     except Exception as e:
-        st.error(f"Error fatal: {e}")
-        return None, 0
-    finally:
-        if os.path.exists(pdf_path): os.remove(pdf_path)
+        st.error(f"Error procesando página con IA: {e}")
+        return []
+
+# ==========================================
+# 🚜 PROCESADOR PRINCIPAL
+# ==========================================
+def process_pdf_with_gemini(pdf_path):
+    st.info("🔄 Convirtiendo PDF a imágenes para que Gemini pueda leerlas...")
+    
+    # 1. Convertir PDF a imágenes
+    try:
+        # dpi=150 es suficiente para Gemini (ahorra ancho de banda), 300 es mejor si hay letra pequeña
+        images = convert_from_path(pdf_path, dpi=200) 
+    except Exception as e:
+        st.error(f"Error leyendo el PDF (Posiblemente falta Poppler): {e}")
+        return pd.DataFrame()
+
+    all_data = []
+    total_pages = len(images)
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    # 2. Iterar por cada página
+    for i, img in enumerate(images):
+        status_text.markdown(f"**Analizando página {i+1} de {total_pages} con Gemini Vision...**")
+        
+        # Llamada a la IA
+        datos_pagina = analizar_imagen_con_gemini(img)
+        
+        if datos_pagina:
+            all_data.extend(datos_pagina)
+            
+        # Actualizar barra
+        progress_bar.progress((i + 1) / total_pages)
+        
+        # Pequeña pausa para no saturar el límite de velocidad de la API (Rate Limit) si usas la capa gratuita
+        time.sleep(1) 
+
+    status_text.success("✅ Análisis completado.")
+    return pd.DataFrame(all_data)
 
 # ==========================================
 # 🖥️ INTERFAZ
 # ==========================================
+with st.sidebar:
+    st.header("Instrucciones")
+    st.write("Esta herramienta usa **Google Gemini Vision**.")
+    st.write("1. La IA 'mira' el documento.")
+    st.write("2. Lee el texto (incluso si está borroso).")
+    st.write("3. Estructura la tabla automáticamente.")
 
-uploaded_file = st.file_uploader("Sube el SAC Completo (PDF)", type=["pdf"])
+uploaded_file = st.file_uploader("Sube tu archivo SAC (PDF)", type=["pdf"])
 
 if uploaded_file is not None:
-    if st.button("🚀 Procesar Documento Gigante"):
+    if st.button("🚀 Iniciar Extracción con IA"):
         
-        csv_path, rows = process_massive_pdf(uploaded_file.read(), batch_size)
+        # Guardar archivo temporal
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(uploaded_file.read())
+            pdf_path = tmp.name
         
-        if rows > 0:
-            st.balloons()
-            st.success(f"✅ Se han extraído {rows} filas de datos.")
+        # Procesar
+        df_result = process_pdf_with_gemini(pdf_path)
+        
+        # Mostrar resultados
+        if not df_result.empty:
+            st.divider()
+            st.subheader("📊 Resultados de la IA")
             
-            # Opción 1: Descargar CSV (Súper rápido y seguro)
-            with open(csv_path, "rb") as f:
-                csv_bytes = f.read()
-                
+            # Asegurar columnas correctas
+            columnas_orden = ["CODIGO", "DESCRIPCION", "DAI"]
+            # Filtrar solo columnas que existan en el resultado
+            cols_final = [c for c in columnas_orden if c in df_result.columns]
+            df_show = df_result[cols_final] if cols_final else df_result
+            
+            st.dataframe(df_show, use_container_width=True)
+            
+            # Descarga
+            csv = df_show.to_csv(index=False).encode('utf-8')
             st.download_button(
-                "📥 Descargar CSV (Recomendado - Más ligero)",
-                data=csv_bytes,
-                file_name="SAC_Completo.csv",
-                mime="text/csv"
+                "📥 Descargar Excel/CSV",
+                csv,
+                "sac_gemini_export.csv",
+                "text/csv",
+                key='download-csv'
             )
-            
-            # Opción 2: Intentar Convertir a Excel (Puede tardar)
-            st.write("---")
-            st.info("Generando Excel... (Si esto falla, usa el botón de CSV de arriba)")
-            
-            try:
-                # Leemos el CSV del disco para pasarlo a Excel
-                # Chunksize ayuda a no saturar memoria al leer para convertir
-                df_final = pd.read_csv(csv_path)
-                
-                buffer = io.BytesIO()
-                with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-                    df_final.to_excel(writer, index=False, sheet_name="SAC")
-                    ws = writer.sheets['SAC']
-                    ws.set_column('B:B', 80)
-                
-                st.download_button(
-                    "📥 Descargar Excel (.xlsx)",
-                    data=buffer.getvalue(),
-                    file_name="SAC_Completo.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-            except Exception as e:
-                st.error(f"El Excel es demasiado grande para generarlo aquí. Por favor descarga el CSV. Error: {e}")
-            
-            # Limpieza final
-            if os.path.exists(csv_path): os.remove(csv_path)
-            
         else:
-            st.warning("No se encontraron datos o hubo un error en la lectura.")
+            st.warning("Gemini no encontró datos tabulares o hubo un error de conexión.")
+            
+        # Limpieza
+        if os.path.exists(pdf_path): os.remove(pdf_path)
