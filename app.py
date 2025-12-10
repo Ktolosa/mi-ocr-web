@@ -8,8 +8,8 @@ import json
 import time
 
 # --- CONFIGURACIÓN ---
-st.set_page_config(page_title="Extractor SAC con Gemini", layout="wide")
-st.title("🤖 Extractor SAC Inteligente (Auto-Detect Model)")
+st.set_page_config(page_title="Extractor IA Multi-Formato", layout="wide")
+st.title("🤖 Nexus Extractor: Filtro Inteligente")
 
 # 1. Configurar API Key
 if "GOOGLE_API_KEY" in st.secrets:
@@ -19,117 +19,164 @@ else:
     st.stop()
 
 # ==========================================
-# 🧠 SELECCIÓN AUTOMÁTICA DE MODELO
+# 🧠 DEFINICIÓN DE PROMPTS POR TIPO (TU VARIABLE)
+# ==========================================
+# Aquí defines las reglas específicas para cada tipo de PDF que cargues.
+PROMPTS_POR_TIPO = {
+    "Factura Internacional (Regal/General)": """
+        Actúa como un experto en comercio exterior. Analiza la imagen de esta factura.
+        
+        REGLA CRÍTICA DE FILTRADO:
+        1. Busca en el encabezado o cuerpo si dice "Original" o "Duplicado".
+        2. SI DICE "Duplicado" o "Copia": Devuelve un JSON vacío: {}. NO extraigas nada.
+        3. SI DICE "Original" (o no especifica): Procede a extraer los datos.
+
+        DATOS A EXTRAER (Solo si es Original):
+        Devuelve un JSON con esta estructura exacta:
+        {
+            "tipo_documento": "Original",
+            "numero_factura": "Extraer Invoice #",
+            "fecha": "Extraer Date",
+            "orden_compra": "Extraer Order #",
+            "proveedor": "Nombre de la empresa vendedora (ej: REGAL...)",
+            "cliente": "Nombre de Sold To",
+            "items": [
+                {
+                    "modelo": "...",
+                    "descripcion": "...",
+                    "cantidad": 0,
+                    "precio_unitario": 0.00,
+                    "total_linea": 0.00
+                }
+            ],
+            "total_factura": 0.00
+        }
+    """,
+    
+    "Otro Tipo de Documento (Ejemplo)": """
+        Analiza este documento... (Aquí pondrías otras reglas)
+    """
+}
+
+# ==========================================
+# 🧠 SELECCIÓN DE MODELO
 # ==========================================
 def conseguir_mejor_modelo():
-    """
-    Consulta a Google qué modelos tiene tu API Key y elige el mejor disponible.
-    Prioridad: 1.5-Flash (Rápido) -> 1.5-Pro (Potente) -> gemini-pro (Legacy)
-    """
     try:
-        # Listar modelos que soportan generar contenido
-        modelos_disponibles = []
-        for m in genai.list_models():
-            if 'generateContent' in m.supported_generation_methods:
-                modelos_disponibles.append(m.name)
-        
-        # Lógica de selección
-        # 1. Buscar Flash (Ideal para OCR rápido)
-        for m in modelos_disponibles:
-            if 'flash' in m.lower() and '1.5' in m:
-                return genai.GenerativeModel(m)
-        
-        # 2. Buscar 1.5 Pro
-        for m in modelos_disponibles:
-            if 'pro' in m.lower() and '1.5' in m:
-                return genai.GenerativeModel(m)
-                
-        # 3. Fallback a lo que sea que haya (gemini-pro estándar)
-        if modelos_disponibles:
-            return genai.GenerativeModel(modelos_disponibles[0])
-            
-        return None
-    except Exception as e:
-        st.error(f"Error al listar modelos: {e}")
+        modelos = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+        # Prioridad: Flash -> Pro -> Cualquiera
+        for m in modelos:
+            if 'flash' in m.lower() and '1.5' in m: return genai.GenerativeModel(m)
+        for m in modelos:
+            if 'pro' in m.lower() and '1.5' in m: return genai.GenerativeModel(m)
+        return genai.GenerativeModel(modelos[0]) if modelos else None
+    except:
         return None
 
-# Inicializar modelo
 model = conseguir_mejor_modelo()
-
-if model is None:
-    st.error("❌ No se encontraron modelos disponibles en tu cuenta de Google AI.")
+if not model:
+    st.error("No se encontraron modelos de Gemini.")
     st.stop()
-else:
-    # Mostramos qué modelo se seleccionó para que estés tranquilo
-    print(f"✅ Usando modelo: {model.model_name}") 
 
 # ==========================================
-# 🧠 LÓGICA DE EXTRACCIÓN (GEMINI)
+# 🧠 LÓGICA DE EXTRACCIÓN
 # ==========================================
-def analizar_imagen_con_gemini(image):
-    prompt = """
-    Actúa como un sistema OCR especializado en tablas de aduanas (SAC).
-    Analiza la imagen adjunta.
-    1. Extrae los datos de la tabla (Código, Descripción, DAI).
-    2. Si hay descripciones en múltiples líneas, únelas.
-    3. Si el OCR es confuso, usa tu lógica para corregir (ej: 'C0DIGO' -> 'CODIGO').
-    4. Devuelve SOLO una lista JSON válida, sin markdown:
-       [{"CODIGO": "...", "DESCRIPCION": "...", "DAI": "..."}]
-    """
+def analizar_pagina(image, prompt_especifico):
     try:
-        response = model.generate_content([prompt, image])
+        response = model.generate_content([prompt_especifico, image])
         texto = response.text.strip()
         
-        # Limpieza de bloques de código
+        # Limpieza JSON
         if "```json" in texto: texto = texto.replace("```json", "").replace("```", "")
         if "```" in texto: texto = texto.replace("```", "")
-            
-        return json.loads(texto)
+        
+        datos = json.loads(texto)
+        return datos
     except Exception as e:
-        st.warning(f"⚠️ Error en una página: {e}")
-        return []
+        print(f"Error o página vacía: {e}")
+        return {}
 
-# ==========================================
-# 🚜 PROCESADOR DE PDF
-# ==========================================
-def process_pdf(pdf_path):
-    st.info(f"Using AI Model: {model.model_name.split('/')[-1]}")
+def process_pdf(pdf_path, tipo_seleccionado):
+    st.info(f"Usando IA: {model.model_name} | Modo: {tipo_seleccionado}")
+    prompt = PROMPTS_POR_TIPO[tipo_seleccionado]
     
     try:
         images = convert_from_path(pdf_path, dpi=200)
     except Exception as e:
         st.error(f"Error leyendo PDF: {e}")
-        return pd.DataFrame()
+        return [], pd.DataFrame()
 
-    all_data = []
+    items_totales = []
+    resumen_facturas = []
+    
     bar = st.progress(0)
     
     for i, img in enumerate(images):
-        data = analizar_imagen_con_gemini(img)
-        if data: all_data.extend(data)
-        bar.progress((i + 1) / len(images))
-        time.sleep(1) # Respetar rate limits
+        # Analizar página con el prompt seleccionado
+        data = analizar_pagina(img, prompt)
         
-    return pd.DataFrame(all_data)
+        # LÓGICA DE FILTRADO: Si la IA devuelve vacío (porque era Duplicado), ignoramos
+        if not data or data.get("tipo_documento") != "Original":
+            st.warning(f"Página {i+1} ignorada (Detectada como Duplicado o sin datos).")
+        else:
+            st.success(f"✅ Página {i+1} procesada como ORIGINAL.")
+            
+            # Aplanamos los datos para la tabla de items
+            factura_id = data.get("numero_factura", "S/N")
+            cliente = data.get("cliente", "")
+            
+            # Guardamos resumen cabecera
+            resumen_facturas.append({
+                "Factura": factura_id,
+                "Fecha": data.get("fecha"),
+                "Total": data.get("total_factura"),
+                "Cliente": cliente
+            })
+            
+            # Guardamos items detalle
+            if "items" in data and isinstance(data["items"], list):
+                for item in data["items"]:
+                    item["Factura_Origen"] = factura_id # Vinculamos item a su factura
+                    items_totales.append(item)
+        
+        bar.progress((i + 1) / len(images))
+        time.sleep(1)
+
+    return resumen_facturas, pd.DataFrame(items_totales)
 
 # ==========================================
 # 🖥️ INTERFAZ
 # ==========================================
-uploaded_file = st.file_uploader("Sube SAC (PDF)", type=["pdf"])
+with st.sidebar:
+    st.header("Configuración")
+    # AQUI ESTÁ TU VARIABLE PARA EL TIPO DE PDF
+    tipo_pdf = st.selectbox(
+        "Selecciona el Tipo de PDF:",
+        list(PROMPTS_POR_TIPO.keys())
+    )
+    st.info("El sistema buscará automáticamente solo las páginas marcadas como ORIGINAL.")
 
-if uploaded_file is not None and st.button("🚀 Iniciar Extracción Inteligente"):
+uploaded_file = st.file_uploader("Sube tu Factura (PDF)", type=["pdf"])
+
+if uploaded_file is not None and st.button("🚀 Extraer Datos"):
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(uploaded_file.read())
         path = tmp.name
     
-    df = process_pdf(path)
+    resumen, df_items = process_pdf(path, tipo_pdf)
     
-    if not df.empty:
-        st.success(f"✅ Extracción completa: {len(df)} registros.")
-        st.dataframe(df)
-        csv = df.to_csv(index=False).encode('utf-8')
-        st.download_button("Descargar CSV", csv, "sac_ia.csv", "text/csv")
+    if not df_items.empty:
+        st.divider()
+        st.subheader("📦 Detalle de Productos (Items)")
+        st.dataframe(df_items, use_container_width=True)
+        
+        st.subheader("📄 Resumen de Documentos Procesados")
+        st.dataframe(pd.DataFrame(resumen), use_container_width=True)
+        
+        # Descarga
+        csv = df_items.to_csv(index=False).encode('utf-8')
+        st.download_button("📥 Descargar Detalle Items (CSV)", csv, "items_originales.csv", "text/csv")
     else:
-        st.warning("No se extrajeron datos.")
+        st.warning("No se encontraron páginas marcadas como 'Original' o hubo un error.")
     
     os.remove(path)
