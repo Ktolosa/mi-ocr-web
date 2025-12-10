@@ -1,6 +1,10 @@
 streamlit
+camelot-py[cv]
+opencv-python-headless
 pandas
 xlsxwriter
 pdf2image
-google-generativeai  <-- NUEVO (SDK de Gemini)
-python-dotenv        <-- Para manejar la API Key localmente si quieres
+pytesseract
+pypdf
+google-generativeai
+python-dotenv
