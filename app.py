@@ -19,31 +19,29 @@ else:
     st.stop()
 
 # ==========================================
-# 🧠 DEFINICIÓN DE PROMPTS POR TIPO (TU VARIABLE)
+# 🧠 DEFINICIÓN DE PROMPTS POR TIPO (ACTUALIZADO)
 # ==========================================
-# Aquí defines las reglas específicas para cada tipo de PDF que cargues.
 PROMPTS_POR_TIPO = {
     "Factura Internacional (Regal/General)": """
         Actúa como un experto en comercio exterior. Analiza la imagen de esta factura.
         
         REGLA CRÍTICA DE FILTRADO:
-        1. Busca en el encabezado o cuerpo si dice "Original" o "Duplicado".
-        2. SI DICE "Duplicado" o "Copia": Devuelve un JSON vacío: {}. NO extraigas nada.
-        3. SI DICE "Original" (o no especifica): Procede a extraer los datos.
+        1. Busca si dice "Original", "Duplicado" o "Copia".
+        2. Si es Duplicado/Copia, devuelve JSON con "tipo_documento": "Copia" y lista de items vacía.
+        3. Si es Original, extrae todo.
 
-        DATOS A EXTRAER (Solo si es Original):
-        Devuelve un JSON con esta estructura exacta:
+        ESTRUCTURA JSON ESPERADA:
         {
-            "tipo_documento": "Original",
-            "numero_factura": "Extraer Invoice #",
-            "fecha": "Extraer Date",
-            "orden_compra": "Extraer Order #",
-            "proveedor": "Nombre de la empresa vendedora (ej: REGAL...)",
-            "cliente": "Nombre de Sold To",
+            "tipo_documento": "Original/Copia",
+            "numero_factura": "Invoice #",
+            "fecha": "Date",
+            "orden_compra": "PO #",
+            "proveedor": "Vendor Name",
+            "cliente": "Sold To",
             "items": [
                 {
-                    "modelo": "...",
-                    "descripcion": "...",
+                    "modelo": "Model",
+                    "descripcion": "Description",
                     "cantidad": 0,
                     "precio_unitario": 0.00,
                     "total_linea": 0.00
@@ -52,9 +50,65 @@ PROMPTS_POR_TIPO = {
             "total_factura": 0.00
         }
     """,
-    
-    "Otro Tipo de Documento (Ejemplo)": """
-        Analiza este documento... (Aquí pondrías otras reglas)
+
+    "Factura RadioShack": """
+        Analiza esta factura de RadioShack Worldwide Corp.
+        
+        INSTRUCCIONES ESPECÍFICAS:
+        1. El número de factura suele estar bajo el texto "COMMERCIAL INVOICE" (ej: 7791).
+        2. La tabla de items tiene columnas: HTSU, SKU, Descripción, Marca, Origen, Cant., Precio Unitario, Valor Total.
+        3. Usa 'SKU' como 'modelo'.
+        4. Extrae también datos logísticos (Peso, Volumen, Contenedor) y añádelos a la descripción del primer item o concaténalos si es posible, o simplemente asegúrate de extraer bien los montos.
+        
+        OUTPUT JSON:
+        {
+            "tipo_documento": "Original",
+            "numero_factura": "Extraer número grande (ej: 7791)",
+            "fecha": "Extraer FECHA FACTURA (ej: 30-SEP-25)",
+            "orden_compra": "Extraer P.O.#",
+            "proveedor": "RadioShack Worldwide Corp",
+            "cliente": "Extraer de VENDIDO A",
+            "items": [
+                {
+                    "modelo": "Columna SKU",
+                    "descripcion": "Columna DESCRIPCION",
+                    "cantidad": 0,
+                    "precio_unitario": 0.00,
+                    "total_linea": 0.00
+                }
+            ],
+            "total_factura": 0.00
+        }
+    """,
+
+    "Factura Mabe": """
+        Analiza esta factura de exportación de Mabe (Controladora Mabe).
+        
+        INSTRUCCIONES ESPECÍFICAS:
+        1. El número de factura está bajo 'Factura Exportacion / Commercial Invoice' (ej: 0901248186).
+        2. La tabla es compleja. Busca las columnas: 'CODIGO MABE', 'DESCRIPCIÓN', 'CANT/QTY', 'PRECIO UNIT/UNIT PRICE', 'IMPORTE NETO/AMOUNT'.
+        3. Ignora las líneas que sean solo texto legal o impuestos (IVA 0.00).
+        4. Extrae el Folio Fiscal (UUID) si aparece y ponlo junto al número de factura (ej: 'Factura # - UUID...').
+        
+        OUTPUT JSON:
+        {
+            "tipo_documento": "Original",
+            "numero_factura": "Extraer #FACTURA CLIENTE o Commercial Invoice",
+            "fecha": "Extraer FECHA/DATE",
+            "orden_compra": "Extraer ORDEN DE COMPRA/PURCHASE ORDER",
+            "proveedor": "Controladora Mabe S.A. de C.V.",
+            "cliente": "Extraer VENDIDO A / SOLD TO",
+            "items": [
+                {
+                    "modelo": "Columna CODIGO MABE o CODIGO CLIENTE",
+                    "descripcion": "Columna DESCRIPCIÓN",
+                    "cantidad": 0,
+                    "precio_unitario": 0.00,
+                    "total_linea": 0.00
+                }
+            ],
+            "total_factura": 0.00
+        }
     """
 }
 
@@ -180,3 +234,4 @@ if uploaded_file is not None and st.button("🚀 Extraer Datos"):
         st.warning("No se encontraron páginas marcadas como 'Original' o hubo un error.")
     
     os.remove(path)
+
