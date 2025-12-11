@@ -19,26 +19,23 @@ else:
     st.stop()
 
 # ==========================================
-# 🧠 DEFINICIÓN DE PROMPTS POR TIPO (TU VARIABLE)
+# 🧠 DEFINICIÓN DE PROMPTS MEJORADA
 # ==========================================
-# Aquí defines las reglas específicas para cada tipo de PDF que cargues.
 PROMPTS_POR_TIPO = {
     "Factura Internacional (Regal/General)": """
         Actúa como un experto en comercio exterior. Analiza la imagen de esta factura.
         
-        REGLA CRÍTICA DE FILTRADO:
-        1. Busca en el encabezado o cuerpo si dice "Original" o "Duplicado".
-        2. SI DICE "Duplicado" o "Copia": Devuelve un JSON vacío: {}. NO extraigas nada.
-        3. SI DICE "Original" (o no especifica): Procede a extraer los datos.
+        TU TAREA PRINCIPAL:
+        1. Identifica si el documento dice explícitamente "Original", "Duplicado", "Copia" o no dice nada.
+        2. Extrae TODOS los datos solicitados sin importar si es copia u original. Nosotros filtraremos después.
 
-        DATOS A EXTRAER (Solo si es Original):
         Devuelve un JSON con esta estructura exacta:
         {
-            "tipo_documento": "Original",
+            "tipo_documento": "Indica aqui textualmente si dice Original, Duplicado o Copia",
             "numero_factura": "Extraer Invoice #",
-            "fecha": "Extraer Date",
+            "fecha": "Extraer Date (Formato YYYY-MM-DD)",
             "orden_compra": "Extraer Order #",
-            "proveedor": "Nombre de la empresa vendedora (ej: REGAL...)",
+            "proveedor": "Nombre de la empresa vendedora",
             "cliente": "Nombre de Sold To",
             "items": [
                 {
@@ -86,14 +83,14 @@ def analizar_pagina(image, prompt_especifico):
         response = model.generate_content([prompt_especifico, image])
         texto = response.text.strip()
         
-        # Limpieza JSON
+        # Limpieza JSON agresiva
         if "```json" in texto: texto = texto.replace("```json", "").replace("```", "")
         if "```" in texto: texto = texto.replace("```", "")
         
         datos = json.loads(texto)
         return datos
     except Exception as e:
-        print(f"Error o página vacía: {e}")
+        print(f"Error procesando respuesta IA: {e}")
         return {}
 
 def process_pdf(pdf_path, tipo_seleccionado):
@@ -112,31 +109,36 @@ def process_pdf(pdf_path, tipo_seleccionado):
     bar = st.progress(0)
     
     for i, img in enumerate(images):
-        # Analizar página con el prompt seleccionado
         data = analizar_pagina(img, prompt)
         
-        # LÓGICA DE FILTRADO: Si la IA devuelve vacío (porque era Duplicado), ignoramos
-        if not data or data.get("tipo_documento") != "Original":
-            st.warning(f"Página {i+1} ignorada (Detectada como Duplicado o sin datos).")
+        # === LÓGICA DE FILTRADO ROBUSTA (EN PYTHON) ===
+        # Normalizamos a minusculas para evitar errores de "Original" vs "original"
+        tipo_doc_raw = str(data.get("tipo_documento", "Original")).lower()
+        
+        # Lista negra: Si dice duplicado o copia, lo marcamos como tal.
+        es_duplicado = any(x in tipo_doc_raw for x in ["duplicado", "copia", "duplicate", "copy"])
+        
+        if not data:
+            st.warning(f"⚠️ Página {i+1}: No se pudieron extraer datos (JSON vacío).")
+        elif es_duplicado:
+            st.warning(f"🚫 Página {i+1} ignorada. Tipo detectado: '{data.get('tipo_documento')}'")
         else:
-            st.success(f"✅ Página {i+1} procesada como ORIGINAL.")
+            st.success(f"✅ Página {i+1} procesada. Tipo detectado: '{data.get('tipo_documento')}'")
             
-            # Aplanamos los datos para la tabla de items
             factura_id = data.get("numero_factura", "S/N")
             cliente = data.get("cliente", "")
             
-            # Guardamos resumen cabecera
             resumen_facturas.append({
                 "Factura": factura_id,
                 "Fecha": data.get("fecha"),
                 "Total": data.get("total_factura"),
-                "Cliente": cliente
+                "Cliente": cliente,
+                "Tipo Detectado": data.get("tipo_documento") 
             })
             
-            # Guardamos items detalle
             if "items" in data and isinstance(data["items"], list):
                 for item in data["items"]:
-                    item["Factura_Origen"] = factura_id # Vinculamos item a su factura
+                    item["Factura_Origen"] = factura_id
                     items_totales.append(item)
         
         bar.progress((i + 1) / len(images))
@@ -149,12 +151,11 @@ def process_pdf(pdf_path, tipo_seleccionado):
 # ==========================================
 with st.sidebar:
     st.header("Configuración")
-    # AQUI ESTÁ TU VARIABLE PARA EL TIPO DE PDF
     tipo_pdf = st.selectbox(
         "Selecciona el Tipo de PDF:",
         list(PROMPTS_POR_TIPO.keys())
     )
-    st.info("El sistema buscará automáticamente solo las páginas marcadas como ORIGINAL.")
+    st.info("El sistema filtrará automáticamente duplicados y copias.")
 
 uploaded_file = st.file_uploader("Sube tu Factura (PDF)", type=["pdf"])
 
@@ -173,10 +174,9 @@ if uploaded_file is not None and st.button("🚀 Extraer Datos"):
         st.subheader("📄 Resumen de Documentos Procesados")
         st.dataframe(pd.DataFrame(resumen), use_container_width=True)
         
-        # Descarga
         csv = df_items.to_csv(index=False).encode('utf-8')
         st.download_button("📥 Descargar Detalle Items (CSV)", csv, "items_originales.csv", "text/csv")
     else:
-        st.warning("No se encontraron páginas marcadas como 'Original' o hubo un error.")
+        st.error("No se encontraron datos válidos en las páginas ORIGINALES.")
     
     os.remove(path)
