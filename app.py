@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import google.generativeai as genai
+from google.api_core.exceptions import ResourceExhausted, TooManyRequests, InternalServerError, ServiceUnavailable
 from pdf2image import convert_from_path
 import tempfile
 import os
@@ -8,16 +9,16 @@ import json
 import time
 
 # --- CONFIGURACIÓN ---
-st.set_page_config(page_title="Extractor IA Separado", layout="wide")
-st.title("🤖 Nexus Extractor: Tablas Individuales por Archivo")
+st.set_page_config(page_title="Extractor IA Multi-Key", layout="wide")
+st.title("🤖 Nexus Extractor: Multi-Llave Robusto")
 
-# 1. Cargar lista de API Keys desde secrets
+# 1. Cargar lista de API Keys
 if "mis_llaves" in st.secrets:
     API_KEYS = st.secrets["mis_llaves"]
 elif "GOOGLE_API_KEY" in st.secrets:
     API_KEYS = [st.secrets["GOOGLE_API_KEY"]]
 else:
-    st.error("❌ Falta configuración de llaves. Configura 'mis_llaves' en secrets.")
+    st.error("❌ Falta configuración. Añade 'mis_llaves' en secrets.toml")
     st.stop()
 
 # ==========================================
@@ -26,28 +27,8 @@ else:
 PROMPTS_POR_TIPO = {
     "Factura Internacional (Regal/General)": """
         Actúa como experto en comercio exterior.
-        REGLA DE FILTRADO:
-        1. Si dice "Duplicado" o "Copia", devuelve "tipo_documento": "Copia" y items vacíos.
-        2. Si es Original, extrae todo.
-        JSON ESPERADO:
-        {
-            "tipo_documento": "Original/Copia",
-            "numero_factura": "Invoice #",
-            "fecha": "Date",
-            "orden_compra": "PO #",
-            "proveedor": "Vendor",
-            "cliente": "Sold To",
-            "items": [
-                {
-                    "modelo": "Model",
-                    "descripcion": "Description",
-                    "cantidad": 0,
-                    "precio_unitario": 0.00,
-                    "total_linea": 0.00
-                }
-            ],
-            "total_factura": 0.00
-        }
+        REGLA: Si dice "Duplicado" o "Copia", devuelve "tipo_documento": "Copia" y items []. Si es "Original", extrae todo.
+        JSON: {"tipo_documento": "Original/Copia", "numero_factura": "...", "fecha": "...", "orden_compra": "...", "proveedor": "...", "cliente": "...", "items": [{"modelo": "...", "descripcion": "...", "cantidad": 0, "precio_unitario": 0.0, "total_linea": 0.0}], "total_factura": 0.0}
     """,
     "Factura RadioShack": """
         Factura RadioShack.
@@ -64,79 +45,116 @@ PROMPTS_POR_TIPO = {
 }
 
 # ==========================================
-# 🧠 FUNCIÓN CON ROTACIÓN DE LLAVES
+# 🧠 FUNCIÓN DE GENERACIÓN CON ROTACIÓN (CORREGIDA)
 # ==========================================
 def intentar_generar_con_rotacion(image, prompt):
-    generation_config = {"temperature": 0.1, "response_mime_type": "application/json"}
+    # Configuración de seguridad muy permisiva para evitar bloqueos falsos
     safety = [
         {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
         {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
         {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
         {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
     ]
+    generation_config = {"temperature": 0.1, "response_mime_type": "application/json"}
 
     errores_log = []
 
+    # Bucle que recorre las llaves una por una
     for index, key in enumerate(API_KEYS):
         try:
+            # 1. Configurar la llave actual
             genai.configure(api_key=key)
-            # Prioridad: Flash -> Pro
+            
+            # 2. Instanciar modelo (Flash es más rápido y tiene mejor cuota gratuita)
             model = genai.GenerativeModel("gemini-1.5-flash", generation_config=generation_config, safety_settings=safety)
             
+            # 3. Llamada a la API
             response = model.generate_content([prompt, image])
             
+            # 4. Validar bloqueo de seguridad
             if response.prompt_feedback and response.prompt_feedback.block_reason:
-                return {}, f"Bloqueo Seguridad Llave {index+1}"
+                # Si se bloquea por "seguridad", cambiar de llave a veces ayuda si es un falso positivo por cuenta
+                print(f"Llave {index+1} bloqueada por seguridad. Saltando...")
+                errores_log.append(f"Key {index+1}: Bloqueo Seguridad")
+                continue 
 
+            # 5. Procesar Texto
             texto = response.text.strip()
+            # Limpieza extra de markdown
             if "```json" in texto: texto = texto.replace("```json", "").replace("```", "")
             if "```" in texto: texto = texto.replace("```", "")
             
+            # 6. ÉXITO: Retornamos los datos y salimos del bucle
             return json.loads(texto), None
 
-        except Exception as e:
-            err_msg = str(e)
-            errores_log.append(f"Llave {index+1}: {err_msg}")
-            if "429" in err_msg or "Resource has been exhausted" in err_msg:
-                continue 
-            else:
-                continue
+        # === AQUÍ ESTÁ LA CORRECCIÓN CLAVE ===
+        # Atrapamos los errores técnicos específicos de Google
+        except (ResourceExhausted, TooManyRequests) as e:
+            msg = f"⚠️ Llave {index+1} AGOTADA (Cuota). Saltando a la siguiente..."
+            print(msg)
+            st.toast(msg) # Notificación visual para ti
+            errores_log.append(f"Key {index+1}: Exhausted")
+            continue # Forzamos el salto a la siguiente iteración (siguiente llave)
 
-    return {}, f"TODAS LAS LLAVES FALLARON. Log: {errores_log}"
+        except (InternalServerError, ServiceUnavailable) as e:
+            msg = f"⚠️ Llave {index+1} error servidor Google. Saltando..."
+            print(msg)
+            errores_log.append(f"Key {index+1}: Server Error")
+            continue
+
+        except Exception as e:
+            # Error genérico (ej: JSON mal formado, o error de red local)
+            err_str = str(e).lower()
+            # Doble verificación por si el error viene como texto plano
+            if "429" in err_str or "exhausted" in err_str or "quota" in err_str:
+                st.toast(f"⚠️ Llave {index+1} agotada (Detectado por texto). Saltando...")
+                continue
+            
+            # Si es otro error, lo guardamos y probamos suerte con la siguiente llave 
+            # (a veces cambiar de cuenta 'refresca' la conexión)
+            errores_log.append(f"Key {index+1} Error genérico: {err_str}")
+            continue
+
+    # Si terminamos el bucle y nadie respondió:
+    return {}, f"FALLO TOTAL. Se probaron {len(API_KEYS)} llaves. Detalles: {errores_log}"
 
 # ==========================================
-# 🧠 LÓGICA DE PROCESAMIENTO INDIVIDUAL
+# 🧠 LÓGICA DE PROCESAMIENTO
 # ==========================================
 def process_single_pdf(pdf_path, filename, tipo_seleccionado):
     prompt = PROMPTS_POR_TIPO[tipo_seleccionado]
     try:
         images = convert_from_path(pdf_path, dpi=200)
     except Exception as e:
-        return [], [], f"Error leyendo PDF: {e}"
+        return [], [], f"Error dañado/legibilidad PDF: {e}"
 
     items_locales = []
     resumen_local = []
     
-    # Barra de progreso pequeña en la barra lateral o toast
     for i, img in enumerate(images):
+        # Llamamos a la función blindada
         data, error = intentar_generar_con_rotacion(img, prompt)
         
-        # Filtro de copias
+        if error:
+            # Si después de todas las llaves hay error, lo mostramos
+            st.error(f"Error en {filename} Pág {i+1}: {error}")
+            continue
+            
+        # Filtro "Copia"
         if not data or "copia" in str(data.get("tipo_documento", "")).lower():
-            continue # Ignorar copias
+            continue 
         
         # Procesar Original
         factura_id = data.get("numero_factura", "S/N")
         
-        # Guardar Item
+        # Guardar Items
         if "items" in data and isinstance(data["items"], list):
             for item in data["items"]:
                 item["Archivo_Origen"] = filename
                 item["Factura_Origen"] = factura_id
                 items_locales.append(item)
-                
-        # Guardar Resumen (solo 1 vez por factura detectada para no duplicar en resumen)
-        # (Aquí simplificamos agregando siempre que hay data, luego puedes filtrar unique)
+        
+        # Guardar Resumen
         resumen_local.append({
             "Archivo": filename,
             "Factura": factura_id,
@@ -144,7 +162,8 @@ def process_single_pdf(pdf_path, filename, tipo_seleccionado):
             "Cliente": data.get("cliente")
         })
         
-        time.sleep(1) # Pausa de cortesía a la API
+        # Pequeña pausa para no saturar si usas la misma llave muy rápido
+        time.sleep(1)
 
     return resumen_local, items_locales, None
 
@@ -153,63 +172,40 @@ def process_single_pdf(pdf_path, filename, tipo_seleccionado):
 # ==========================================
 with st.sidebar:
     st.header("Configuración")
-    tipo_pdf = st.selectbox("Selecciona el Tipo de PDF:", list(PROMPTS_POR_TIPO.keys()))
-    st.caption(f"🔑 Llaves activas: {len(API_KEYS)}")
+    tipo_pdf = st.selectbox("Plantilla:", list(PROMPTS_POR_TIPO.keys()))
+    st.success(f"🔑 {len(API_KEYS)} Llaves cargadas y listas para rotar.")
 
-uploaded_files = st.file_uploader("Sube tus Facturas (PDF)", type=["pdf"], accept_multiple_files=True)
+uploaded_files = st.file_uploader("Sube Facturas (PDF)", type=["pdf"], accept_multiple_files=True)
 
-if uploaded_files and st.button("🚀 Procesar Archivos"):
+if uploaded_files and st.button("🚀 Procesar"):
     
-    gran_acumulado_items = [] # Para el botón de "Descargar Todo" al final
+    gran_acumulado = []
     
     st.divider()
-    st.subheader(f"📊 Resultados por Archivo ({len(uploaded_files)})")
+    st.subheader(f"Resultados ({len(uploaded_files)} archivos)")
     
-    # BUCLE PRINCIPAL: Procesar y MOSTRAR archivo por archivo
     for idx, uploaded_file in enumerate(uploaded_files):
-        
-        # Crear contenedor visual para este archivo
-        with st.expander(f"📄 Archivo {idx+1}: {uploaded_file.name}", expanded=True):
-            
-            # Spinner local
-            with st.spinner(f"Analizando {uploaded_file.name}..."):
-                # Crear temporal
+        with st.expander(f"📄 {uploaded_file.name}", expanded=True):
+            with st.spinner(f"Procesando {uploaded_file.name}..."):
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
                     tmp.write(uploaded_file.read())
                     path = tmp.name
-                    filename = uploaded_file.name
+                    fname = uploaded_file.name
                 
-                # Procesar
-                resumen, items, error_msg = process_single_pdf(path, filename, tipo_pdf)
-                os.remove(path) # Limpiar
+                resumen, items, error = process_single_pdf(path, fname, tipo_pdf)
+                os.remove(path)
                 
-                if error_msg:
-                    st.error(error_msg)
-                elif items:
-                    # === AQUÍ ESTÁ EL CAMBIO: TABLA INDIVIDUAL ===
-                    df_local = pd.DataFrame(items)
-                    
-                    # Mostramos tabla específica de este archivo
-                    st.success(f"✅ Se encontraron {len(items)} items.")
-                    st.dataframe(df_local, use_container_width=True)
-                    
-                    # Acumulamos para el csv final
-                    gran_acumulado_items.extend(items)
+                if items:
+                    df = pd.DataFrame(items)
+                    st.success(f"✅ {len(items)} items extraídos.")
+                    st.dataframe(df, use_container_width=True)
+                    gran_acumulado.extend(items)
+                elif error:
+                    st.error(error)
                 else:
-                    st.warning("⚠️ No se extrajeron datos (Posible duplicado o copia).")
+                    st.warning("⚠️ Sin datos (Posible copia o PDF vacío).")
 
-    # --- ZONA DE DESCARGA GLOBAL ---
-    if gran_acumulado_items:
+    if gran_acumulado:
         st.divider()
-        st.subheader("📥 Descarga Consolidada")
-        st.info("Aunque ves las tablas separadas arriba, puedes descargar todo junto en un solo Excel aquí:")
-        
-        df_master = pd.DataFrame(gran_acumulado_items)
-        csv = df_master.to_csv(index=False).encode('utf-8')
-        
-        st.download_button(
-            label="Descargar TODAS las tablas en CSV",
-            data=csv,
-            file_name="extraccion_completa.csv",
-            mime="text/csv"
-        )
+        csv = pd.DataFrame(gran_acumulado).to_csv(index=False).encode('utf-8')
+        st.download_button("📥 Descargar Todo (CSV)", csv, "extraccion_total.csv", "text/csv")
