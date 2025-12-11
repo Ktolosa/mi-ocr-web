@@ -7,9 +7,9 @@ import os
 import json
 import time
 
-# --- CONFIGURACIÓN DE PÁGINA ---
-st.set_page_config(page_title="Nexus Extractor Pro", layout="wide")
-st.title("🤖 Nexus Extractor: Filtro Inteligente & Robusto")
+# --- CONFIGURACIÓN ---
+st.set_page_config(page_title="Extractor IA Multi-Formato", layout="wide")
+st.title("🤖 Nexus Extractor: Filtro Inteligente")
 
 # 1. Configurar API Key
 if "GOOGLE_API_KEY" in st.secrets:
@@ -19,31 +19,31 @@ else:
     st.stop()
 
 # ==========================================
-# 🧠 DEFINICIÓN DE PROMPTS (ESTRATEGIA ROBUSTA)
+# 🧠 DEFINICIÓN DE PROMPTS POR TIPO (TU VARIABLE)
 # ==========================================
+# Aquí defines las reglas específicas para cada tipo de PDF que cargues.
 PROMPTS_POR_TIPO = {
     "Factura Internacional (Regal/General)": """
         Actúa como un experto en comercio exterior. Analiza la imagen de esta factura.
         
-        TU OBJETIVO: Extraer datos estructurados independientemente de si es original o copia.
-        
-        INSTRUCCIONES DE EXTRACCIÓN:
-        1. Busca en el documento palabras como "Original", "Duplicado", "Copia", "Copy".
-        2. Extrae ese texto exacto en el campo 'tipo_documento'.
-        3. Extrae TODOS los datos de la factura (Items, montos, fechas) SIN FILTRAR NADA AÚN.
-        
-        Devuelve SOLAMENTE un JSON con esta estructura:
+        REGLA CRÍTICA DE FILTRADO:
+        1. Busca en el encabezado o cuerpo si dice "Original" o "Duplicado".
+        2. SI DICE "Duplicado" o "Copia": Devuelve un JSON vacío: {}. NO extraigas nada.
+        3. SI DICE "Original" (o no especifica): Procede a extraer los datos.
+
+        DATOS A EXTRAER (Solo si es Original):
+        Devuelve un JSON con esta estructura exacta:
         {
-            "tipo_documento": "Texto encontrado (ej: Original, Duplicado, Copia)",
-            "numero_factura": "Invoice Number",
-            "fecha": "Date (YYYY-MM-DD)",
-            "orden_compra": "Order Number",
-            "proveedor": "Vendedor / Shipper",
-            "cliente": "Sold To / Consignee",
+            "tipo_documento": "Original",
+            "numero_factura": "Extraer Invoice #",
+            "fecha": "Extraer Date",
+            "orden_compra": "Extraer Order #",
+            "proveedor": "Nombre de la empresa vendedora (ej: REGAL...)",
+            "cliente": "Nombre de Sold To",
             "items": [
                 {
-                    "modelo": "Model / Item Code",
-                    "descripcion": "Description",
+                    "modelo": "...",
+                    "descripcion": "...",
                     "cantidad": 0,
                     "precio_unitario": 0.00,
                     "total_linea": 0.00
@@ -52,142 +52,113 @@ PROMPTS_POR_TIPO = {
             "total_factura": 0.00
         }
     """,
-    "Otro Tipo de Documento": "Analiza este documento y extrae los datos clave en JSON."
+    
+    "Otro Tipo de Documento (Ejemplo)": """
+        Analiza este documento... (Aquí pondrías otras reglas)
+    """
 }
 
 # ==========================================
-# 🧠 SELECCIÓN DE MODELO Y SEGURIDAD
+# 🧠 SELECCIÓN DE MODELO
 # ==========================================
 def conseguir_mejor_modelo():
-    # 1. Configuración de generación para forzar JSON
-    generation_config = {
-        "temperature": 0.1,
-        "response_mime_type": "application/json",
-    }
-    
-    # 2. Desactivar filtros de seguridad (Crucial para documentos comerciales)
-    safety_settings = [
-        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-    ]
-
     try:
         modelos = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        
-        # Prioridad: Flash 1.5 -> Pro 1.5
-        modelo_seleccionado = next((m for m in modelos if 'flash' in m.lower() and '1.5' in m), None)
-        if not modelo_seleccionado:
-            modelo_seleccionado = next((m for m in modelos if 'pro' in m.lower() and '1.5' in m), None)
-            
-        if modelo_seleccionado:
-            return genai.GenerativeModel(
-                model_name=modelo_seleccionado,
-                generation_config=generation_config,
-                safety_settings=safety_settings
-            )
-        return None
-    except Exception as e:
-        st.error(f"Error conectando con Google AI: {e}")
+        # Prioridad: Flash -> Pro -> Cualquiera
+        for m in modelos:
+            if 'flash' in m.lower() and '1.5' in m: return genai.GenerativeModel(m)
+        for m in modelos:
+            if 'pro' in m.lower() and '1.5' in m: return genai.GenerativeModel(m)
+        return genai.GenerativeModel(modelos[0]) if modelos else None
+    except:
         return None
 
 model = conseguir_mejor_modelo()
 if not model:
-    st.error("No se pudo iniciar el modelo de IA.")
+    st.error("No se encontraron modelos de Gemini.")
     st.stop()
 
 # ==========================================
-# 🧠 LÓGICA DE ANÁLISIS
+# 🧠 LÓGICA DE EXTRACCIÓN
 # ==========================================
-def analizar_pagina(image, prompt):
+def analizar_pagina(image, prompt_especifico):
     try:
-        response = model.generate_content([prompt, image])
-        
-        # Verificar bloqueos de seguridad explícitos
-        if response.prompt_feedback and response.prompt_feedback.block_reason:
-            st.error(f"⚠️ Bloqueo de IA: {response.prompt_feedback}")
-            return {}
-
+        response = model.generate_content([prompt_especifico, image])
         texto = response.text.strip()
-        # Limpieza extra por seguridad
-        if "```json" in texto: texto = texto.replace("```json", "").replace("```", "")
         
-        return json.loads(texto)
-
+        # Limpieza JSON
+        if "```json" in texto: texto = texto.replace("```json", "").replace("```", "")
+        if "```" in texto: texto = texto.replace("```", "")
+        
+        datos = json.loads(texto)
+        return datos
     except Exception as e:
-        error_msg = str(e)
-        if "429" in error_msg:
-            st.error("📉 ERROR DE CUOTA (429): Has excedido el límite de consultas diarias a la API.")
-        else:
-            st.error(f"❌ Error al procesar página: {error_msg}")
+        print(f"Error o página vacía: {e}")
         return {}
 
 def process_pdf(pdf_path, tipo_seleccionado):
-    st.info(f"⚡ Motor IA: {model.model_name} | Estrategia: Extracción + Filtrado Python")
+    st.info(f"Usando IA: {model.model_name} | Modo: {tipo_seleccionado}")
     prompt = PROMPTS_POR_TIPO[tipo_seleccionado]
     
     try:
         images = convert_from_path(pdf_path, dpi=200)
     except Exception as e:
-        st.error(f"Error crítico leyendo PDF (Poppler): {e}")
+        st.error(f"Error leyendo PDF: {e}")
         return [], pd.DataFrame()
 
     items_totales = []
-    resumen_docs = []
+    resumen_facturas = []
     
     bar = st.progress(0)
     
     for i, img in enumerate(images):
-        st.write(f"⏳ Analizando página {i+1}...")
+        # Analizar página con el prompt seleccionado
         data = analizar_pagina(img, prompt)
         
-        if not data:
-            st.warning(f"⚠️ Página {i+1}: La IA no devolvió datos válidos.")
+        # LÓGICA DE FILTRADO: Si la IA devuelve vacío (porque era Duplicado), ignoramos
+        if not data or data.get("tipo_documento") != "Original":
+            st.warning(f"Página {i+1} ignorada (Detectada como Duplicado o sin datos).")
         else:
-            # === FILTRO PYTHON (MÁS SEGURO) ===
-            tipo_doc = str(data.get("tipo_documento", "Original")).lower()
-            palabras_prohibidas = ["duplicado", "copia", "duplicate", "copy"]
+            st.success(f"✅ Página {i+1} procesada como ORIGINAL.")
             
-            es_copia = any(p in tipo_doc for p in palabras_prohibidas)
+            # Aplanamos los datos para la tabla de items
+            factura_id = data.get("numero_factura", "S/N")
+            cliente = data.get("cliente", "")
             
-            if es_copia:
-                st.warning(f"🚫 Página {i+1} DESCARTADA. Detectado como: '{data.get('tipo_documento')}'")
-            else:
-                st.success(f"✅ Página {i+1} APROBADA. Tipo: '{data.get('tipo_documento')}'")
-                
-                # Procesar datos
-                factura_id = data.get("numero_factura", f"PAG-{i+1}")
-                resumen_docs.append({
-                    "Página": i+1,
-                    "Factura": factura_id,
-                    "Fecha": data.get("fecha"),
-                    "Total": data.get("total_factura"),
-                    "Cliente": data.get("cliente"),
-                    "Estado": "Procesado"
-                })
-                
-                if "items" in data and isinstance(data["items"], list):
-                    for item in data["items"]:
-                        item["Factura_Origen"] = factura_id
-                        items_totales.append(item)
+            # Guardamos resumen cabecera
+            resumen_facturas.append({
+                "Factura": factura_id,
+                "Fecha": data.get("fecha"),
+                "Total": data.get("total_factura"),
+                "Cliente": cliente
+            })
+            
+            # Guardamos items detalle
+            if "items" in data and isinstance(data["items"], list):
+                for item in data["items"]:
+                    item["Factura_Origen"] = factura_id # Vinculamos item a su factura
+                    items_totales.append(item)
         
         bar.progress((i + 1) / len(images))
-        time.sleep(1) # Pequeña pausa para no saturar la API
+        time.sleep(1)
 
-    return resumen_docs, pd.DataFrame(items_totales)
+    return resumen_facturas, pd.DataFrame(items_totales)
 
 # ==========================================
-# 🖥️ INTERFAZ DE USUARIO
+# 🖥️ INTERFAZ
 # ==========================================
 with st.sidebar:
-    st.header("🎛️ Panel de Control")
-    tipo_pdf = st.selectbox("Plantilla de Extracción:", list(PROMPTS_POR_TIPO.keys()))
-    st.info("ℹ️ Nota: El sistema leerá todas las páginas y descartará automáticamente las que digan 'Duplicado'.")
+    st.header("Configuración")
+    # AQUI ESTÁ TU VARIABLE PARA EL TIPO DE PDF
+    tipo_pdf = st.selectbox(
+        "Selecciona el Tipo de PDF:",
+        list(PROMPTS_POR_TIPO.keys())
+    )
+    st.info("El sistema buscará automáticamente solo las páginas marcadas como ORIGINAL.")
 
-uploaded_file = st.file_uploader("📂 Sube tu archivo PDF aquí", type=["pdf"])
+uploaded_file = st.file_uploader("Sube tu Factura (PDF)", type=["pdf"])
 
-if uploaded_file and st.button("🚀 Iniciar Extracción"):
+if uploaded_file is not None and st.button("🚀 Extraer Datos"):
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(uploaded_file.read())
         path = tmp.name
@@ -196,21 +167,16 @@ if uploaded_file and st.button("🚀 Iniciar Extracción"):
     
     if not df_items.empty:
         st.divider()
-        st.subheader("📦 Items Extraídos (Originales)")
+        st.subheader("📦 Detalle de Productos (Items)")
         st.dataframe(df_items, use_container_width=True)
         
-        st.subheader("📄 Resumen de Facturas")
+        st.subheader("📄 Resumen de Documentos Procesados")
         st.dataframe(pd.DataFrame(resumen), use_container_width=True)
         
-        # Botón Descarga
+        # Descarga
         csv = df_items.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label="📥 Descargar Excel / CSV",
-            data=csv,
-            file_name="extraccion_facturas.csv",
-            mime="text/csv"
-        )
+        st.download_button("📥 Descargar Detalle Items (CSV)", csv, "items_originales.csv", "text/csv")
     else:
-        st.warning("No se encontraron items válidos. Revisa si todas las páginas eran copias o si hubo error de API.")
+        st.warning("No se encontraron páginas marcadas como 'Original' o hubo un error.")
     
     os.remove(path)
