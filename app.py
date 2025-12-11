@@ -8,172 +8,229 @@ import json
 import time
 
 # --- CONFIGURACIÓN ---
-st.set_page_config(page_title="Extractor IA (Single Key)", layout="wide")
-st.title("🤖 Nexus Extractor: Versión Estable (1 Llave)")
+st.set_page_config(page_title="Extractor IA Multi-Formato", layout="wide")
+st.title("🤖 Nexus Extractor: Filtro Inteligente")
 
-# 1. Configurar API Key Única
+# 1. Configurar API Key
 if "GOOGLE_API_KEY" in st.secrets:
-    api_key = st.secrets["GOOGLE_API_KEY"]
-    genai.configure(api_key=api_key)
+    genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
 else:
     st.error("❌ Falta la API KEY. Configura 'GOOGLE_API_KEY' en los secrets.")
     st.stop()
 
 # ==========================================
-# 🧠 DEFINICIÓN DE PROMPTS
+# 🧠 DEFINICIÓN DE PROMPTS POR TIPO (ACTUALIZADO)
 # ==========================================
 PROMPTS_POR_TIPO = {
     "Factura Internacional (Regal/General)": """
-        Actúa como experto en comercio exterior.
-        REGLA: Si dice "Duplicado" o "Copia", devuelve "tipo_documento": "Copia" y items []. Si es "Original", extrae todo.
-        JSON: {"tipo_documento": "Original/Copia", "numero_factura": "...", "fecha": "...", "orden_compra": "...", "proveedor": "...", "cliente": "...", "items": [{"modelo": "...", "descripcion": "...", "cantidad": 0, "precio_unitario": 0.0, "total_linea": 0.0}], "total_factura": 0.0}
+        Actúa como un experto en comercio exterior. Analiza la imagen de esta factura.
+        
+        REGLA CRÍTICA DE FILTRADO:
+        1. Busca si dice "Original", "Duplicado" o "Copia".
+        2. Si es Duplicado/Copia, devuelve JSON con "tipo_documento": "Copia" y lista de items vacía.
+        3. Si es Original, extrae todo.
+
+        ESTRUCTURA JSON ESPERADA:
+        {
+            "tipo_documento": "Original/Copia",
+            "numero_factura": "Invoice #",
+            "fecha": "Date",
+            "orden_compra": "PO #",
+            "proveedor": "Vendor Name",
+            "cliente": "Sold To",
+            "items": [
+                {
+                    "modelo": "Model",
+                    "descripcion": "Description",
+                    "cantidad": 0,
+                    "precio_unitario": 0.00,
+                    "total_linea": 0.00
+                }
+            ],
+            "total_factura": 0.00
+        }
     """,
+
     "Factura RadioShack": """
-        Factura RadioShack.
-        1. Factura # bajo 'COMMERCIAL INVOICE'.
-        2. Items: SKU (modelo), Descripción, Cant, Precio, Valor.
-        OUTPUT JSON: { "tipo_documento": "Original", "numero_factura": "...", "fecha": "...", "proveedor": "RadioShack", "cliente": "...", "items": [{"modelo": "...", "descripcion": "...", "cantidad": 0, "precio_unitario": 0.0, "total_linea": 0.0}], "total_factura": 0.0 }
+        Analiza esta factura de RadioShack Worldwide Corp.
+        
+        INSTRUCCIONES ESPECÍFICAS:
+        1. El número de factura suele estar bajo el texto "COMMERCIAL INVOICE" (ej: 7791).
+        2. La tabla de items tiene columnas: HTSU, SKU, Descripción, Marca, Origen, Cant., Precio Unitario, Valor Total.
+        3. Usa 'SKU' como 'modelo'.
+        4. Extrae también datos logísticos (Peso, Volumen, Contenedor) y añádelos a la descripción del primer item o concaténalos si es posible, o simplemente asegúrate de extraer bien los montos.
+        
+        OUTPUT JSON:
+        {
+            "tipo_documento": "Original",
+            "numero_factura": "Extraer número grande (ej: 7791)",
+            "fecha": "Extraer FECHA FACTURA (ej: 30-SEP-25)",
+            "orden_compra": "Extraer P.O.#",
+            "proveedor": "RadioShack Worldwide Corp",
+            "cliente": "Extraer de VENDIDO A",
+            "items": [
+                {
+                    "modelo": "Columna SKU",
+                    "descripcion": "Columna DESCRIPCION",
+                    "cantidad": 0,
+                    "precio_unitario": 0.00,
+                    "total_linea": 0.00
+                }
+            ],
+            "total_factura": 0.00
+        }
     """,
+
     "Factura Mabe": """
-        Factura Mabe.
-        1. Factura # bajo 'Factura Exportacion'.
-        2. Items: CODIGO MABE (modelo), Descripción, Cant, Precio Unit, Importe.
-        OUTPUT JSON: { "tipo_documento": "Original", "numero_factura": "...", "fecha": "...", "proveedor": "Mabe", "cliente": "...", "items": [{"modelo": "...", "descripcion": "...", "cantidad": 0, "precio_unitario": 0.0, "total_linea": 0.0}], "total_factura": 0.0 }
+        Analiza esta factura de exportación de Mabe (Controladora Mabe).
+        
+        INSTRUCCIONES ESPECÍFICAS:
+        1. El número de factura está bajo 'Factura Exportacion / Commercial Invoice' (ej: 0901248186).
+        2. La tabla es compleja. Busca las columnas: 'CODIGO MABE', 'DESCRIPCIÓN', 'CANT/QTY', 'PRECIO UNIT/UNIT PRICE', 'IMPORTE NETO/AMOUNT'.
+        3. Ignora las líneas que sean solo texto legal o impuestos (IVA 0.00).
+        4. Extrae el Folio Fiscal (UUID) si aparece y ponlo junto al número de factura (ej: 'Factura # - UUID...').
+        
+        OUTPUT JSON:
+        {
+            "tipo_documento": "Original",
+            "numero_factura": "Extraer #FACTURA CLIENTE o Commercial Invoice",
+            "fecha": "Extraer FECHA/DATE",
+            "orden_compra": "Extraer ORDEN DE COMPRA/PURCHASE ORDER",
+            "proveedor": "Controladora Mabe S.A. de C.V.",
+            "cliente": "Extraer VENDIDO A / SOLD TO",
+            "items": [
+                {
+                    "modelo": "Columna CODIGO MABE o CODIGO CLIENTE",
+                    "descripcion": "Columna DESCRIPCIÓN",
+                    "cantidad": 0,
+                    "precio_unitario": 0.00,
+                    "total_linea": 0.00
+                }
+            ],
+            "total_factura": 0.00
+        }
     """
 }
 
 # ==========================================
-# 🧠 BUSCADOR DE MODELO (Evita error 404)
+# 🧠 SELECCIÓN DE MODELO
 # ==========================================
-def obtener_modelo_dinamico():
-    """Busca el nombre exacto del modelo disponible en tu cuenta."""
+def conseguir_mejor_modelo():
     try:
         modelos = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        
-        # 1. Buscar Flash 1.5
-        flash = next((m for m in modelos if 'flash' in m.lower() and '1.5' in m), None)
-        if flash: return flash
-        
-        # 2. Buscar Pro 1.5
-        pro = next((m for m in modelos if 'pro' in m.lower() and '1.5' in m), None)
-        if pro: return pro
-        
-        # 3. Fallback
-        return modelos[0] if modelos else "models/gemini-1.5-flash"
+        # Prioridad: Flash -> Pro -> Cualquiera
+        for m in modelos:
+            if 'flash' in m.lower() and '1.5' in m: return genai.GenerativeModel(m)
+        for m in modelos:
+            if 'pro' in m.lower() and '1.5' in m: return genai.GenerativeModel(m)
+        return genai.GenerativeModel(modelos[0]) if modelos else None
     except:
-        return "models/gemini-1.5-flash"
+        return None
 
-# Inicializamos el modelo una sola vez
-NOMBRE_MODELO = obtener_modelo_dinamico()
-st.sidebar.info(f"✅ Modelo conectado: {NOMBRE_MODELO}")
+model = conseguir_mejor_modelo()
+if not model:
+    st.error("No se encontraron modelos de Gemini.")
+    st.stop()
 
 # ==========================================
-# 🧠 LÓGICA DE ANÁLISIS
+# 🧠 LÓGICA DE EXTRACCIÓN
 # ==========================================
-def analizar_pagina(image, prompt):
-    generation_config = {"temperature": 0.1, "response_mime_type": "application/json"}
-    safety = [
-        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-    ]
-
+def analizar_pagina(image, prompt_especifico):
     try:
-        model = genai.GenerativeModel(NOMBRE_MODELO, generation_config=generation_config, safety_settings=safety)
-        response = model.generate_content([prompt, image])
-        
-        if response.prompt_feedback and response.prompt_feedback.block_reason:
-            return {}, "Bloqueo de Seguridad (Safety Filter)"
-
+        response = model.generate_content([prompt_especifico, image])
         texto = response.text.strip()
+        
+        # Limpieza JSON
         if "```json" in texto: texto = texto.replace("```json", "").replace("```", "")
         if "```" in texto: texto = texto.replace("```", "")
         
-        return json.loads(texto), None
-
+        datos = json.loads(texto)
+        return datos
     except Exception as e:
-        err_msg = str(e)
-        if "429" in err_msg or "exhausted" in err_msg:
-            return {}, "⚠️ CUOTA EXCEDIDA: Has alcanzado el límite diario de Google."
-        return {}, f"Error técnico: {err_msg}"
+        print(f"Error o página vacía: {e}")
+        return {}
 
-def procesar_pdf(pdf_path, filename, tipo_seleccionado):
+def process_pdf(pdf_path, tipo_seleccionado):
+    st.info(f"Usando IA: {model.model_name} | Modo: {tipo_seleccionado}")
     prompt = PROMPTS_POR_TIPO[tipo_seleccionado]
+    
     try:
         images = convert_from_path(pdf_path, dpi=200)
     except Exception as e:
-        return [], [], f"Error leyendo PDF: {e}"
+        st.error(f"Error leyendo PDF: {e}")
+        return [], pd.DataFrame()
 
-    items_locales = []
-    resumen_local = []
+    items_totales = []
+    resumen_facturas = []
+    
+    bar = st.progress(0)
     
     for i, img in enumerate(images):
-        data, error = analizar_pagina(img, prompt)
+        # Analizar página con el prompt seleccionado
+        data = analizar_pagina(img, prompt)
         
-        if error:
-            st.error(f"{filename} Pág {i+1}: {error}")
-            continue
+        # LÓGICA DE FILTRADO: Si la IA devuelve vacío (porque era Duplicado), ignoramos
+        if not data or data.get("tipo_documento") != "Original":
+            st.warning(f"Página {i+1} ignorada (Detectada como Duplicado o sin datos).")
+        else:
+            st.success(f"✅ Página {i+1} procesada como ORIGINAL.")
             
-        # Filtro Copias
-        if not data or "copia" in str(data.get("tipo_documento", "")).lower():
-            continue 
+            # Aplanamos los datos para la tabla de items
+            factura_id = data.get("numero_factura", "S/N")
+            cliente = data.get("cliente", "")
             
-        factura_id = data.get("numero_factura", "S/N")
+            # Guardamos resumen cabecera
+            resumen_facturas.append({
+                "Factura": factura_id,
+                "Fecha": data.get("fecha"),
+                "Total": data.get("total_factura"),
+                "Cliente": cliente
+            })
+            
+            # Guardamos items detalle
+            if "items" in data and isinstance(data["items"], list):
+                for item in data["items"]:
+                    item["Factura_Origen"] = factura_id # Vinculamos item a su factura
+                    items_totales.append(item)
         
-        if "items" in data and isinstance(data["items"], list):
-            for item in data["items"]:
-                item["Archivo_Origen"] = filename
-                item["Factura_Origen"] = factura_id
-                items_locales.append(item)
-        
-        resumen_local.append({
-            "Archivo": filename,
-            "Factura": factura_id,
-            "Total": data.get("total_factura"),
-            "Cliente": data.get("cliente")
-        })
-        
-        time.sleep(1) # Pausa breve para cuidar la cuota
+        bar.progress((i + 1) / len(images))
+        time.sleep(1)
 
-    return resumen_local, items_locales, None
+    return resumen_facturas, pd.DataFrame(items_totales)
 
 # ==========================================
 # 🖥️ INTERFAZ
 # ==========================================
 with st.sidebar:
     st.header("Configuración")
-    tipo_pdf = st.selectbox("Plantilla:", list(PROMPTS_POR_TIPO.keys()))
+    # AQUI ESTÁ TU VARIABLE PARA EL TIPO DE PDF
+    tipo_pdf = st.selectbox(
+        "Selecciona el Tipo de PDF:",
+        list(PROMPTS_POR_TIPO.keys())
+    )
+    st.info("El sistema buscará automáticamente solo las páginas marcadas como ORIGINAL.")
 
-uploaded_files = st.file_uploader("Sube Facturas (PDF)", type=["pdf"], accept_multiple_files=True)
+uploaded_file = st.file_uploader("Sube tu Factura (PDF)", type=["pdf"])
 
-if uploaded_files and st.button("🚀 Procesar Archivos"):
+if uploaded_file is not None and st.button("🚀 Extraer Datos"):
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(uploaded_file.read())
+        path = tmp.name
     
-    gran_acumulado = []
-    st.divider()
+    resumen, df_items = process_pdf(path, tipo_pdf)
     
-    for uploaded_file in uploaded_files:
-        with st.expander(f"📄 {uploaded_file.name}", expanded=True):
-            with st.spinner(f"Analizando {uploaded_file.name}..."):
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                    tmp.write(uploaded_file.read())
-                    path = tmp.name
-                    fname = uploaded_file.name
-                
-                resumen, items, error = procesar_pdf(path, fname, tipo_pdf)
-                os.remove(path)
-                
-                if items:
-                    df = pd.DataFrame(items)
-                    st.success(f"✅ Extracción exitosa: {len(items)} items.")
-                    st.dataframe(df, use_container_width=True)
-                    gran_acumulado.extend(items)
-                elif error:
-                    st.error(error)
-                else:
-                    st.warning("⚠️ Sin datos (Documento 'Copia' o vacío).")
-
-    if gran_acumulado:
+    if not df_items.empty:
         st.divider()
-        csv = pd.DataFrame(gran_acumulado).to_csv(index=False).encode('utf-8')
-        st.download_button("📥 Descargar Todo (CSV)", csv, "extraccion_completa.csv", "text/csv")
+        st.subheader("📦 Detalle de Productos (Items)")
+        st.dataframe(df_items, use_container_width=True)
+        
+        st.subheader("📄 Resumen de Documentos Procesados")
+        st.dataframe(pd.DataFrame(resumen), use_container_width=True)
+        
+        # Descarga
+        csv = df_items.to_csv(index=False).encode('utf-8')
+        st.download_button("📥 Descargar Detalle Items (CSV)", csv, "items_originales.csv", "text/csv")
+    else:
+        st.warning("No se encontraron páginas marcadas como 'Original' o hubo un error.")
+    
+    os.remove(path)
