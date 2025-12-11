@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
 import google.generativeai as genai
-from google.api_core.exceptions import ResourceExhausted, TooManyRequests, InternalServerError, ServiceUnavailable, NotFound, InvalidArgument
 from pdf2image import convert_from_path
 import tempfile
 import os
@@ -9,16 +8,15 @@ import json
 import time
 
 # --- CONFIGURACIÓN ---
-st.set_page_config(page_title="Extractor IA Auto-Detect", layout="wide")
-st.title("🤖 Nexus Extractor: Auto-Detección Inteligente")
+st.set_page_config(page_title="Extractor IA (Single Key)", layout="wide")
+st.title("🤖 Nexus Extractor: Versión Estable (1 Llave)")
 
-# 1. Cargar lista de API Keys
-if "mis_llaves" in st.secrets:
-    API_KEYS = st.secrets["mis_llaves"]
-elif "GOOGLE_API_KEY" in st.secrets:
-    API_KEYS = [st.secrets["GOOGLE_API_KEY"]]
+# 1. Configurar API Key Única
+if "GOOGLE_API_KEY" in st.secrets:
+    api_key = st.secrets["GOOGLE_API_KEY"]
+    genai.configure(api_key=api_key)
 else:
-    st.error("❌ Falta configuración. Añade 'mis_llaves' en secrets.toml")
+    st.error("❌ Falta la API KEY. Configura 'GOOGLE_API_KEY' en los secrets.")
     st.stop()
 
 # ==========================================
@@ -45,50 +43,35 @@ PROMPTS_POR_TIPO = {
 }
 
 # ==========================================
-# 🧠 FUNCIÓN DE AUTO-DETECCIÓN DE MODELO
+# 🧠 BUSCADOR DE MODELO (Evita error 404)
 # ==========================================
-def obtener_mejor_modelo_disponible():
-    """
-    Pregunta a la API qué modelos tiene activos esta API Key y elige el mejor.
-    Prioridad: Flash 1.5 -> Pro 1.5 -> Flash 2.0 (si existe) -> Cualquiera disponible.
-    """
+def obtener_modelo_dinamico():
+    """Busca el nombre exacto del modelo disponible en tu cuenta."""
     try:
-        # Listar todos los modelos que soportan generar contenido
-        todos_modelos = list(genai.list_models())
-        modelos_generativos = [m for m in todos_modelos if 'generateContent' in m.supported_generation_methods]
-        nombres = [m.name for m in modelos_generativos]
+        modelos = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
         
-        # Estrategia de búsqueda
-        # 1. Buscar Flash 1.5 (Balance perfecto velocidad/costo)
-        for nombre in nombres:
-            if 'flash' in nombre.lower() and '1.5' in nombre:
-                return nombre
+        # 1. Buscar Flash 1.5
+        flash = next((m for m in modelos if 'flash' in m.lower() and '1.5' in m), None)
+        if flash: return flash
         
-        # 2. Buscar Pro 1.5 (Más potente, menos cuota)
-        for nombre in nombres:
-            if 'pro' in nombre.lower() and '1.5' in nombre:
-                return nombre
-                
-        # 3. Buscar cualquier "Gemini" si los anteriores fallan
-        for nombre in nombres:
-            if 'gemini' in nombre.lower():
-                return nombre
+        # 2. Buscar Pro 1.5
+        pro = next((m for m in modelos if 'pro' in m.lower() and '1.5' in m), None)
+        if pro: return pro
+        
+        # 3. Fallback
+        return modelos[0] if modelos else "models/gemini-1.5-flash"
+    except:
+        return "models/gemini-1.5-flash"
 
-        # Si no encuentra nada conocido, devuelve el primero de la lista
-        if nombres:
-            return nombres[0]
-            
-        return None
-    except Exception as e:
-        print(f"Error listando modelos: {e}")
-        return None
+# Inicializamos el modelo una sola vez
+NOMBRE_MODELO = obtener_modelo_dinamico()
+st.sidebar.info(f"✅ Modelo conectado: {NOMBRE_MODELO}")
 
 # ==========================================
-# 🧠 LOGICA DE ROTACIÓN BLINDADA
+# 🧠 LÓGICA DE ANÁLISIS
 # ==========================================
-def intentar_generar_con_rotacion(image, prompt):
+def analizar_pagina(image, prompt):
     generation_config = {"temperature": 0.1, "response_mime_type": "application/json"}
-    # Filtros de seguridad en NULO para evitar bloqueos falsos
     safety = [
         {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
         {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
@@ -96,84 +79,46 @@ def intentar_generar_con_rotacion(image, prompt):
         {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
     ]
 
-    errores_log = []
-
-    for index, key in enumerate(API_KEYS):
-        try:
-            # 1. Configurar la llave
-            genai.configure(api_key=key)
-            
-            # 2. AUTO-DETECTAR MODELO (Aquí está la magia)
-            nombre_modelo = obtener_mejor_modelo_disponible()
-            
-            if not nombre_modelo:
-                errores_log.append(f"Key {index+1}: No se encontraron modelos disponibles.")
-                continue
-
-            # 3. Instanciar con el nombre REAL encontrado
-            model = genai.GenerativeModel(nombre_modelo, generation_config=generation_config, safety_settings=safety)
-            
-            # 4. Generar
-            response = model.generate_content([prompt, image])
-            
-            # 5. Validaciones
-            if response.prompt_feedback and response.prompt_feedback.block_reason:
-                errores_log.append(f"Key {index+1}: Bloqueo Seguridad")
-                continue 
-
-            texto = response.text.strip()
-            if "```json" in texto: texto = texto.replace("```json", "").replace("```", "")
-            if "```" in texto: texto = texto.replace("```", "")
-            
-            # Si llegamos aquí, funcionó
-            return json.loads(texto), None
-
-        # Captura de errores de Cuota (429) y Servidor
-        except (ResourceExhausted, TooManyRequests) as e:
-            st.toast(f"⚠️ Llave {index+1} agotada. Cambiando...")
-            errores_log.append(f"Key {index+1}: Cuota Agotada")
-            continue
+    try:
+        model = genai.GenerativeModel(NOMBRE_MODELO, generation_config=generation_config, safety_settings=safety)
+        response = model.generate_content([prompt, image])
         
-        # Captura de error "No encontrado" o "Invalido"
-        except (NotFound, InvalidArgument) as e:
-            errores_log.append(f"Key {index+1}: Error modelo ({str(e)})")
-            continue
+        if response.prompt_feedback and response.prompt_feedback.block_reason:
+            return {}, "Bloqueo de Seguridad (Safety Filter)"
 
-        except Exception as e:
-            # Captura genérica (incluye 404 si viene como texto)
-            err_str = str(e).lower()
-            if "429" in err_str or "exhausted" in err_str:
-                st.toast(f"⚠️ Llave {index+1} agotada. Cambiando...")
-                continue
-            
-            errores_log.append(f"Key {index+1} Error: {err_str}")
-            continue
+        texto = response.text.strip()
+        if "```json" in texto: texto = texto.replace("```json", "").replace("```", "")
+        if "```" in texto: texto = texto.replace("```", "")
+        
+        return json.loads(texto), None
 
-    return {}, f"FALLO TOTAL. Detalles: {errores_log}"
+    except Exception as e:
+        err_msg = str(e)
+        if "429" in err_msg or "exhausted" in err_msg:
+            return {}, "⚠️ CUOTA EXCEDIDA: Has alcanzado el límite diario de Google."
+        return {}, f"Error técnico: {err_msg}"
 
-# ==========================================
-# 🧠 PROCESAMIENTO
-# ==========================================
-def process_single_pdf(pdf_path, filename, tipo_seleccionado):
+def procesar_pdf(pdf_path, filename, tipo_seleccionado):
     prompt = PROMPTS_POR_TIPO[tipo_seleccionado]
     try:
         images = convert_from_path(pdf_path, dpi=200)
     except Exception as e:
-        return [], [], f"Error PDF dañado: {e}"
+        return [], [], f"Error leyendo PDF: {e}"
 
     items_locales = []
     resumen_local = []
     
     for i, img in enumerate(images):
-        data, error = intentar_generar_con_rotacion(img, prompt)
+        data, error = analizar_pagina(img, prompt)
         
         if error:
-            st.error(f"Error {filename} Pág {i+1}: {error}")
+            st.error(f"{filename} Pág {i+1}: {error}")
             continue
             
+        # Filtro Copias
         if not data or "copia" in str(data.get("tipo_documento", "")).lower():
             continue 
-        
+            
         factura_id = data.get("numero_factura", "S/N")
         
         if "items" in data and isinstance(data["items"], list):
@@ -189,7 +134,7 @@ def process_single_pdf(pdf_path, filename, tipo_seleccionado):
             "Cliente": data.get("cliente")
         })
         
-        time.sleep(1)
+        time.sleep(1) # Pausa breve para cuidar la cuota
 
     return resumen_local, items_locales, None
 
@@ -199,15 +144,15 @@ def process_single_pdf(pdf_path, filename, tipo_seleccionado):
 with st.sidebar:
     st.header("Configuración")
     tipo_pdf = st.selectbox("Plantilla:", list(PROMPTS_POR_TIPO.keys()))
-    st.info(f"🔑 Sistema activo: {len(API_KEYS)} credenciales.")
 
 uploaded_files = st.file_uploader("Sube Facturas (PDF)", type=["pdf"], accept_multiple_files=True)
 
-if uploaded_files and st.button("🚀 Procesar"):
+if uploaded_files and st.button("🚀 Procesar Archivos"):
+    
     gran_acumulado = []
     st.divider()
     
-    for idx, uploaded_file in enumerate(uploaded_files):
+    for uploaded_file in uploaded_files:
         with st.expander(f"📄 {uploaded_file.name}", expanded=True):
             with st.spinner(f"Analizando {uploaded_file.name}..."):
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
@@ -215,19 +160,20 @@ if uploaded_files and st.button("🚀 Procesar"):
                     path = tmp.name
                     fname = uploaded_file.name
                 
-                resumen, items, error = process_single_pdf(path, fname, tipo_pdf)
+                resumen, items, error = procesar_pdf(path, fname, tipo_pdf)
                 os.remove(path)
                 
                 if items:
                     df = pd.DataFrame(items)
+                    st.success(f"✅ Extracción exitosa: {len(items)} items.")
                     st.dataframe(df, use_container_width=True)
                     gran_acumulado.extend(items)
                 elif error:
                     st.error(error)
                 else:
-                    st.warning("⚠️ Sin datos (Copia o vacío).")
+                    st.warning("⚠️ Sin datos (Documento 'Copia' o vacío).")
 
     if gran_acumulado:
         st.divider()
         csv = pd.DataFrame(gran_acumulado).to_csv(index=False).encode('utf-8')
-        st.download_button("📥 Descargar Todo (CSV)", csv, "extraccion_total.csv", "text/csv")
+        st.download_button("📥 Descargar Todo (CSV)", csv, "extraccion_completa.csv", "text/csv")
